@@ -79,6 +79,8 @@ impl SctpSocketTokio {
     }
 
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
+        self.afd.get_ref().subscribe_aux();
+        self.afd.get_ref().subscribe_addr();
         self.afd.get_ref().set_noblock()?;
 
         if let Err(e) = self.afd.get_ref().connect(address) {
@@ -141,6 +143,9 @@ impl SctpSocketTokio {
             Ok(())
         }
     }
+    pub fn subscribe_notifications(&mut self, s: tokio::sync::mpsc::Sender<sctp::Notification>) {
+        self.afd.get_mut().subscribe_notifications(s);
+    }
 
     pub async fn sendmsg(&self, data: &[u8], info: &SndInfo) -> Result<usize> {
         loop {
@@ -190,6 +195,19 @@ impl SctpSocketTokio {
             break res;
         }
     }
+    pub async fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
+        loop {
+            let mut guard = self.afd.readable().await?;
+            let res = self.afd.get_ref().recvmsg_detailed(data, info);
+            if let Err(e) = &res {
+                if e.raw_os_error().is_some_and(|f| f == libc::EWOULDBLOCK) {
+                    guard.clear_ready();
+                    continue;
+                }
+            }
+            break res;
+        }
+    }
     pub async fn accept(&self) -> Result<SctpSocketTokio> {
         self.afd.get_ref().set_noblock()?;
         loop {
@@ -212,6 +230,9 @@ impl SctpSocketTokio {
     pub fn subscribe_aux(&self) -> Result<()> {
         self.afd.get_ref().subscribe_aux()
     }
+    pub fn subscribe_addr(&self) -> Result<()> {
+        self.afd.get_ref().subscribe_addr()
+    }
 
     pub fn listen(&self, backlog: i32) -> Result<()> {
         self.afd.get_ref().listen(backlog)
@@ -219,8 +240,14 @@ impl SctpSocketTokio {
     pub fn set_init(&self, info: Init) -> Result<()> {
         self.afd.get_ref().set_init(info)
     }
+    pub fn set_rto(&self, info: RtoInfo) -> Result<()> {
+        self.afd.get_ref().set_rto(info)
+    }
     pub fn set_nodelay(&self, enable: bool) -> Result<()> {
         self.afd.get_ref().set_nodelay(enable)
+    }
+    pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
+        self.afd.get_ref().set_rcvbuf(size)
     }
 
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {

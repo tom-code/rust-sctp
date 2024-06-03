@@ -20,7 +20,7 @@ async fn main() {
         println!("incoming connection");
         tokio::spawn(async move {
             loop {
-                let mut buffer = [0 as u8; 1024 * 10];
+                let mut buffer = [0; 1024 * 10];
                 let received = client.recvmsg(&mut buffer).await;
                 match received {
                     Err(e) => {
