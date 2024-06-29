@@ -115,7 +115,7 @@ pub struct NotificationHeader {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct PaddrChange {
+pub struct IPaddrChange {
     pub spc_type: u16,
     pub spc_flags: u16,
     pub spc_length: u32,
@@ -132,7 +132,8 @@ pub struct NotificationAddress {
 }
 #[derive(Debug)]
 pub enum Notification {
-    address(NotificationAddress)
+    Address(NotificationAddress),
+    Shutdown()
 }
 
 fn handle_libc_error(err: i32) -> Result<()> {
@@ -251,6 +252,9 @@ impl SctpSocket {
             std::net::Shutdown::Read => libc::SHUT_RD,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
+        if let Some(q) = &self.notification_queue {
+            q.try_send(Notification::Shutdown()).unwrap();
+        }
         handle_libc_error(unsafe { libc::shutdown(self.fd, flag) })
     }
     pub fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
@@ -433,8 +437,8 @@ impl SctpSocket {
         println!("not {:?}", header);
         if header.sn_type == 0x8002 {
             let paddr = unsafe {
-                let paddr_ptr = data as *const _ as *const PaddrChange;
-                &*paddr_ptr.cast::<PaddrChange>()
+                let paddr_ptr = data as *const _ as *const IPaddrChange;
+                &*paddr_ptr.cast::<IPaddrChange>()
             };
             println!("not {:?}", paddr);
             unsafe {
@@ -448,7 +452,7 @@ impl SctpSocket {
                     state: paddr.spc_state,
                     error: paddr.spc_error
                 };
-                let not = Notification::address(n);
+                let not = Notification::Address(n);
                 if let Some(q) = &self.notification_queue {
                     q.try_send(not).unwrap();
                 }
@@ -505,6 +509,7 @@ impl Drop for SctpSocket {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.fd);
+            //println!("drop socket");
         }
     }
 }

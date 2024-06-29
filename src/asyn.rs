@@ -79,8 +79,8 @@ impl SctpSocketTokio {
     }
 
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
-        self.afd.get_ref().subscribe_aux();
-        self.afd.get_ref().subscribe_addr();
+        self.afd.get_ref().subscribe_aux()?;
+        self.afd.get_ref().subscribe_addr()?;
         self.afd.get_ref().set_noblock()?;
 
         if let Err(e) = self.afd.get_ref().connect(address) {

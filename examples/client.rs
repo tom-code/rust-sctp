@@ -1,3 +1,5 @@
+use sctp::Notification;
+
 const REMOTE: &str = "127.0.0.1:9999";
 
 #[tokio::main]
@@ -6,11 +8,19 @@ async fn main() {
 
     let (notification_queue_sender, mut notification_queue_receiver) = tokio::sync::mpsc::channel::<sctp::Notification>(32);
     let notification_task = tokio::spawn(async move {
-        loop {
+        'lo: loop {
             let notification = notification_queue_receiver.recv().await;
             println!("notification {:?}", notification);
+            match notification {
+                Some(Notification::Shutdown()) => {
+                    break 'lo
+                },
+                Some(_) => {},
+                None => {},
+            }
         }
     });
+
     let connected = std::sync::Arc::new(loop {
         let mut socket = sctp::SctpSocketTokio::new().unwrap();
         socket
@@ -74,7 +84,6 @@ async fn main() {
 
     // then shutdown
     connected.shutdown(std::net::Shutdown::Both).unwrap();
-
     read_task.await.unwrap();
     notification_task.await.unwrap();
     println!("read done");
