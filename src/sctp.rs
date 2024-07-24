@@ -124,6 +124,21 @@ pub struct IPaddrChange {
     pub spc_error: u32,
 }
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct Status {
+    pub sstat_assoc_id: u32,
+    pub sstat_state: i32,
+    pub sstat_rwnd: u32,
+    pub sstat_unackdata: u16,
+    pub sstat_penddata: u16,
+    pub sstat_instrms: u16,
+    pub sstat_outstrms: u16,
+    pub sstat_fragmentation_point: u32,
+    //pub sstat_primary: Struct_sctp_paddrinfo,
+}
+
+
 #[derive(Debug)]
 pub struct NotificationAddress {
     addr: std::net::SocketAddr,
@@ -363,7 +378,7 @@ impl SctpSocket {
                 msghdr.msg_controllen = hlen;
             }
         }
-        let r = unsafe { libc::sendmsg(self.fd, &msghdr as *const _ as *mut libc::msghdr, 0) };
+        let r = unsafe { libc::sendmsg(self.fd, &msghdr as *const _ as *mut libc::msghdr, libc::MSG_DONTWAIT) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
@@ -402,7 +417,7 @@ impl SctpSocket {
                             //sndrcv info
                             let data = libc::CMSG_DATA(cmsghdr);
                             let _info = data as *mut SndRcvInfo;
-                            println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
+                            //println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
                         }
                         if (*cmsghdr).cmsg_type == SCTP_DSTADDRV4 {
                             println!("rcv info! dst");
@@ -495,7 +510,7 @@ impl SctpSocket {
                         let data = libc::CMSG_DATA(cmsghdr);
                         let _info = data as *mut SndRcvInfo;
                         core::ptr::write(info, *_info);
-                        println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
+                        //println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
                     }
                     cmsghdr = libc::CMSG_NXTHDR(&msghdr as *const libc::msghdr, cmsghdr)
                 }

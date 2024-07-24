@@ -12,6 +12,7 @@ use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
 #[derive(Debug)]
 pub struct SctpSocketTokio {
     pub(crate) afd: AsyncFd<SctpSocket>,
+    failed: std::sync::atomic::AtomicBool
 }
 
 impl AsyncRead for SctpSocketTokio {
@@ -63,12 +64,12 @@ impl SctpSocketTokio {
     pub fn new() -> Result<Self> {
         let fdx = SctpSocket::new()?;
         let afd = AsyncFd::new(fdx)?;
-        Ok(Self { afd })
+        Ok(Self { afd, failed: std::sync::atomic::AtomicBool::new(false) })
     }
     pub fn new6() -> Result<Self> {
         let fdx = SctpSocket::new6()?;
         let afd = AsyncFd::new(fdx)?;
-        Ok(Self { afd })
+        Ok(Self { afd, failed: std::sync::atomic::AtomicBool::new(false) })
     }
 
     pub fn bind(&self, address: std::net::SocketAddr) -> Result<()> {
@@ -79,7 +80,7 @@ impl SctpSocketTokio {
     }
 
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
-        self.afd.get_ref().subscribe_aux()?;
+        //self.afd.get_ref().subscribe_aux()?;
         self.afd.get_ref().subscribe_addr()?;
         self.afd.get_ref().set_noblock()?;
 
@@ -155,6 +156,9 @@ impl SctpSocketTokio {
                 if e.raw_os_error().is_some_and(|f| f == libc::EWOULDBLOCK) {
                     guard.clear_ready();
                     continue;
+                } else {
+                    self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let _ = self.afd.get_ref().shutdown(std::net::Shutdown::Both);
                 }
             }
             break res;
@@ -176,6 +180,10 @@ impl SctpSocketTokio {
                 if e.raw_os_error().is_some_and(|f| f == libc::EWOULDBLOCK) {
                     guard.clear_ready();
                     continue;
+                } else {
+                    self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    println!("set to failed");
+                    let _ = self.afd.get_ref().shutdown(std::net::Shutdown::Both);
                 }
             }
             break res;
@@ -184,6 +192,9 @@ impl SctpSocketTokio {
 
     pub async fn recvmsg(&self, data: &mut [u8]) -> Result<usize> {
         loop {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(0)
+            }
             let mut guard = self.afd.readable().await?;
             let res = self.afd.get_ref().recvmsg(data);
             if let Err(e) = &res {
@@ -197,6 +208,9 @@ impl SctpSocketTokio {
     }
     pub async fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
         loop {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(0)
+            }
             let mut guard = self.afd.readable().await?;
             let res = self.afd.get_ref().recvmsg_detailed(data, info);
             if let Err(e) = &res {
@@ -216,7 +230,7 @@ impl SctpSocketTokio {
                 Ok(new) => {
                     let afd = AsyncFd::new(new)?;
                     afd.get_ref().set_noblock()?;
-                    return Ok(SctpSocketTokio { afd });
+                    return Ok(SctpSocketTokio { afd, failed: std::sync::atomic::AtomicBool::new(false) });
                 }
                 Err(e) => match e.raw_os_error() {
                     Some(libc::EWOULDBLOCK) => {
