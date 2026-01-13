@@ -443,6 +443,38 @@ impl SctpSocket {
             }
         }
     }
+    pub fn getsocketname(&self) -> Result<std::net::SocketAddr> {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        handle_libc_error(unsafe {
+            libc::getsockname(
+                self.fd,
+                &mut storage as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            )
+        })?;
+        let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
+        match osa.into_addr() {
+            Some(addr) => Ok(addr),
+            None => Err(Error::new(std::io::ErrorKind::Other, "Invalid socket address")),
+        }
+    }
+    pub fn getpeername(&self) -> Result<std::net::SocketAddr> {
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        handle_libc_error(unsafe {
+            libc::getpeername(
+                self.fd,
+                &mut storage as *mut _ as *mut libc::sockaddr,
+                &mut len,
+            )
+        })?;
+        let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
+        match osa.into_addr() {
+            Some(addr) => Ok(addr),
+            None => Err(Error::new(std::io::ErrorKind::Other, "Invalid socket address")),
+        }
+    }
 
     fn handle_notification(&self, data: &[u8]) {
         let header = unsafe {

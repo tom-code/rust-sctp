@@ -81,7 +81,7 @@ impl SctpSocketTokio {
 
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
         //self.afd.get_ref().subscribe_aux()?;
-        self.afd.get_ref().subscribe_addr()?;
+        //self.afd.get_ref().subscribe_addr()?;
         self.afd.get_ref().set_noblock()?;
 
         if let Err(e) = self.afd.get_ref().connect(address) {
@@ -263,6 +263,13 @@ impl SctpSocketTokio {
     pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
         self.afd.get_ref().set_rcvbuf(size)
     }
+    pub fn getsocketname(&self) -> Result<std::net::SocketAddr> {
+        self.afd.get_ref().getsocketname()
+    }
+    pub fn getpeername(&self) -> Result<std::net::SocketAddr> {
+        self.afd.get_ref().getpeername()
+    }
+
 
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
         self.afd.get_ref().shutdown(how)
