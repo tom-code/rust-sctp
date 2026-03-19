@@ -63,11 +63,13 @@ impl AsyncWrite for SctpSocketTokio {
 impl SctpSocketTokio {
     pub fn new() -> Result<Self> {
         let fdx = SctpSocket::new()?;
+        fdx.set_noblock()?;
         let afd = AsyncFd::new(fdx)?;
         Ok(Self { afd, failed: std::sync::atomic::AtomicBool::new(false) })
     }
     pub fn new6() -> Result<Self> {
         let fdx = SctpSocket::new6()?;
+        fdx.set_noblock()?;
         let afd = AsyncFd::new(fdx)?;
         Ok(Self { afd, failed: std::sync::atomic::AtomicBool::new(false) })
     }
@@ -80,10 +82,6 @@ impl SctpSocketTokio {
     }
 
     pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
-        //self.afd.get_ref().subscribe_aux()?;
-        //self.afd.get_ref().subscribe_addr()?;
-        self.afd.get_ref().set_noblock()?;
-
         if let Err(e) = self.afd.get_ref().connect(address) {
             if !e.raw_os_error().is_some_and(|e| e == libc::EINPROGRESS) {
                 return Err(e);
@@ -92,14 +90,14 @@ impl SctpSocketTokio {
         let _guard = self.afd.writable().await?;
 
         let (so_error, getsockopt_result) = unsafe {
-            let err: libc::c_int = 0;
-            let len: libc::socklen_t = 4;
+            let mut err: libc::c_int = 0;
+            let mut len: libc::socklen_t = 4;
             let res = libc::getsockopt(
                 self.afd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_ERROR,
-                &err as *const libc::c_int as *mut libc::c_void,
-                &len as *const libc::socklen_t as *mut libc::socklen_t,
+                &mut err as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
             );
             (err, res)
         };
@@ -114,8 +112,6 @@ impl SctpSocketTokio {
     }
 
     pub async fn connectx(&self, addresses: &[std::net::SocketAddr]) -> Result<()> {
-        self.afd.get_ref().set_noblock()?;
-
         if let Err(e) = self.afd.get_ref().connectx(addresses) {
             if !e.raw_os_error().is_some_and(|e| e == libc::EINPROGRESS) {
                 return Err(e);
@@ -124,14 +120,14 @@ impl SctpSocketTokio {
         let _guard = self.afd.writable().await?;
 
         let (so_error, getsockopt_result) = unsafe {
-            let err: libc::c_int = 0;
-            let len: libc::socklen_t = 4;
+            let mut err: libc::c_int = 0;
+            let mut len: libc::socklen_t = 4;
             let res = libc::getsockopt(
                 self.afd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_ERROR,
-                &err as *const libc::c_int as *mut libc::c_void,
-                &len as *const libc::socklen_t as *mut libc::socklen_t,
+                &mut err as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
             );
             (err, res)
         };
@@ -212,24 +208,27 @@ impl SctpSocketTokio {
                 return Ok(0)
             }
             let mut guard = self.afd.readable().await?;
-            let res = self.afd.get_ref().recvmsg_detailed(data, info);
-            if let Err(e) = &res {
-                if e.raw_os_error().is_some_and(|f| f == libc::EWOULDBLOCK) {
+            let res = self.afd.get_ref().recvmsg_detailed_i(data, info);
+            match &res {
+                Ok(0x99999999) => {
                     guard.clear_ready();
                     continue;
                 }
+                Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    guard.clear_ready();
+                    continue;
+                }
+                _ => break res,
             }
-            break res;
         }
     }
     pub async fn accept(&self) -> Result<SctpSocketTokio> {
-        self.afd.get_ref().set_noblock()?;
         loop {
             let ret = self.afd.get_ref().accept();
             match ret {
                 Ok(new) => {
+                    new.set_noblock()?;
                     let afd = AsyncFd::new(new)?;
-                    afd.get_ref().set_noblock()?;
                     return Ok(SctpSocketTokio { afd, failed: std::sync::atomic::AtomicBool::new(false) });
                 }
                 Err(e) => match e.raw_os_error() {

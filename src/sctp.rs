@@ -352,7 +352,7 @@ impl SctpSocket {
         };
         //just take enough room on stack to avoid extra allocation
         const SPACE: usize = 512;
-        let hbuffer = [0; SPACE];
+        let mut hbuffer = [0; SPACE];
         //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
         //let mut hbuffer = vec![0 as u8; space];
 
@@ -360,7 +360,7 @@ impl SctpSocket {
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_iov = &mut iovec_item;
         msghdr.msg_iovlen = 1;
-        msghdr.msg_control = &hbuffer as *const _ as *mut libc::c_void;
+        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
         msghdr.msg_controllen = SPACE as _;
         unsafe {
             let hlen = libc::CMSG_LEN(std::mem::size_of::<SndInfo>() as u32) as _;
@@ -378,7 +378,7 @@ impl SctpSocket {
                 msghdr.msg_controllen = hlen;
             }
         }
-        let r = unsafe { libc::sendmsg(self.fd, &msghdr as *const _ as *mut libc::msghdr, libc::MSG_DONTWAIT) };
+        let r = unsafe { libc::sendmsg(self.fd, &mut msghdr as *mut libc::msghdr, libc::MSG_DONTWAIT) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
@@ -394,7 +394,7 @@ impl SctpSocket {
 
         //just take enough room on stack to avoid extra allocation
         const SPACE: usize = 512;
-        let hbuffer = [0; SPACE];
+        let mut hbuffer = [0; SPACE];
         //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
         //let mut hbuffer = vec![0 as u8; space];
 
@@ -402,10 +402,10 @@ impl SctpSocket {
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_iov = &mut iovec_item;
         msghdr.msg_iovlen = 1;
-        msghdr.msg_control = &hbuffer as *const _ as *mut libc::c_void;
+        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
         msghdr.msg_controllen = SPACE as _;
 
-        let r = unsafe { libc::recvmsg(self.fd, &msghdr as *const _ as *mut libc::msghdr, 0) };
+        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
@@ -515,7 +515,7 @@ impl SctpSocket {
 
         //just take enough room on stack to avoid extra allocation
         const SPACE: usize = 512;
-        let hbuffer = [0; SPACE];
+        let mut hbuffer = [0; SPACE];
         //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
         //let mut hbuffer = vec![0 as u8; space];
 
@@ -523,10 +523,10 @@ impl SctpSocket {
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_iov = &mut iovec_item;
         msghdr.msg_iovlen = 1;
-        msghdr.msg_control = &hbuffer as *const _ as *mut libc::c_void;
+        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
         msghdr.msg_controllen = SPACE as _;
 
-        let r = unsafe { libc::recvmsg(self.fd, &msghdr as *const _ as *mut libc::msghdr, 0) };
+        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
