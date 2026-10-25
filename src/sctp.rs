@@ -397,7 +397,8 @@ impl SctpSocket {
         msghdr.msg_iovlen = 1;
         cbuf.attach(&mut msghdr);
         unsafe { write_sndinfo_cmsg(&mut msghdr, info) };
-        let r = unsafe { libc::sendmsg(self.fd, &mut msghdr as *mut libc::msghdr, libc::MSG_DONTWAIT) };
+        // no MSG_DONTWAIT: blocking sockets block, and SctpSocketTokio sets O_NONBLOCK
+        let r = unsafe { libc::sendmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
