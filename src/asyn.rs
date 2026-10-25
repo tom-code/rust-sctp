@@ -201,6 +201,54 @@ impl SctpSocketTokio {
             break res;
         }
     }
+    /// Receives one complete SCTP message into `msg`, reading until MSG_EOR.
+    /// Returns the message length, or 0 when the peer has shut down.
+    ///
+    /// Cancel safe when the same `msg` is passed again: if the future is
+    /// dropped mid-message, the bytes read so far stay in `msg` and the next
+    /// call appends the rest. Otherwise `msg` is cleared first. This also
+    /// applies after another receive method stopped mid-message.
+    pub async fn recvmsg_full(&self, msg: &mut Vec<u8>) -> Result<usize> {
+        const MIN_READ: usize = 4096;
+        if !self.afd.get_ref().in_partial_message() {
+            msg.clear();
+        }
+        loop {
+            if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(0)
+            }
+            let mut guard = self.afd.readable().await?;
+            // grow msg only after the await, so a cancelled call leaves no padding in it
+            let start = msg.len();
+            if msg.capacity() - start < MIN_READ {
+                msg.reserve(MIN_READ.max(start));
+            }
+            msg.resize(msg.capacity(), 0);
+            let res = self.afd.get_ref().recvmsg_eor(&mut msg[start..]);
+            match res {
+                Ok((n, eor)) => {
+                    msg.truncate(start + n);
+                    if n == 0 {
+                        if start == 0 {
+                            return Ok(0);
+                        }
+                        return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed mid-message"));
+                    }
+                    if eor {
+                        return Ok(msg.len());
+                    }
+                }
+                Err(e) => {
+                    msg.truncate(start);
+                    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+                        guard.clear_ready();
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
     pub async fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
         loop {
             if self.failed.load(std::sync::atomic::Ordering::SeqCst) {

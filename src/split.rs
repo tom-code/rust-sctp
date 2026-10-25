@@ -28,6 +28,9 @@ impl ReadHalfSctp {
     pub async fn recvmsg(&self, data: &mut [u8]) -> Result<usize> {
         self.inner.recvmsg(data).await
     }
+    pub async fn recvmsg_full(&self, msg: &mut Vec<u8>) -> Result<usize> {
+        self.inner.recvmsg_full(msg).await
+    }
 }
 
 impl WriteHalfSctp {

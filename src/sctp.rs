@@ -1,6 +1,6 @@
 use std::io::{Error, Result};
-use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use os_socketaddr::OsSocketAddr;
 
@@ -9,7 +9,11 @@ use os_socketaddr::OsSocketAddr;
 pub struct SctpSocket {
     fd: RawFd,
     pub(crate) ppid: u32,
-    notification_queue: Option<tokio::sync::mpsc::Sender<Notification>>
+    notification_queue: Option<tokio::sync::mpsc::Sender<Notification>>,
+    // set while the pieces of a notification larger than the read buffer are being received
+    notification_partial: AtomicBool,
+    // set when the last data read ended without MSG_EOR, i.e. mid-message
+    data_partial: AtomicBool,
 }
 
 const SOL_SCTP: libc::c_int = 132;
@@ -28,9 +32,13 @@ const SCTP_SNDINFO: i32 = 2;
 //const SCTP_RCVINFO: i32 = 3;
 //const SCTP_NXTINFO: i32 = 4;
 //const SCTP_PRINFO: i32 = 5;
-const SCTP_DSTADDRV4: i32 = 7;
+//const SCTP_DSTADDRV4: i32 = 7;
 
 const SCTP_NODELAY: i32 = 3;
+
+// msg_flags bit set by the kernel when the received message is an SCTP notification
+const MSG_NOTIFICATION: libc::c_int = 0x8000;
+const SCTP_PEER_ADDR_CHANGE: u16 = 0x8002;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -165,14 +173,14 @@ impl SctpSocket {
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None })
+        Ok(Self { fd, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
     }
     pub fn new6() -> Result<Self> {
         let fd = unsafe { libc::socket(libc::PF_INET6, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None })
+        Ok(Self { fd, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
     }
     pub fn set_ppid(&mut self, ppid: u32) {
         self.ppid = ppid;
@@ -317,7 +325,7 @@ impl SctpSocket {
         if r < 0 {
             return Err(Error::last_os_error());
         }
-        Ok(SctpSocket { fd: r, ppid: 0, notification_queue: None })
+        Ok(SctpSocket { fd: r, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
     }
 
     fn socketaddrlist_to_os(addresses: &[std::net::SocketAddr]) -> Vec<u8> {
@@ -356,34 +364,14 @@ impl SctpSocket {
             iov_base: data.as_ptr() as *mut libc::c_void,
             iov_len: data.len(),
         };
-        //just take enough room on stack to avoid extra allocation
-        const SPACE: usize = 512;
-        let mut hbuffer = [0; SPACE];
-        //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
-        //let mut hbuffer = vec![0 as u8; space];
+        let mut cbuf = CmsgBuf::new();
 
         // zeroed must be used to support linux-musl which has some private padding crap
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_iov = &mut iovec_item;
         msghdr.msg_iovlen = 1;
-        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
-        msghdr.msg_controllen = SPACE as _;
-        unsafe {
-            let hlen = libc::CMSG_LEN(std::mem::size_of::<SndInfo>() as u32) as _;
-            let cmsg_hdr = libc::CMSG_FIRSTHDR(&msghdr);
-            if !cmsg_hdr.is_null() {
-                (*cmsg_hdr).cmsg_level = libc::IPPROTO_SCTP;
-                (*cmsg_hdr).cmsg_type = SCTP_SNDINFO;
-                (*cmsg_hdr).cmsg_len = hlen;
-
-                std::ptr::copy(
-                    std::ptr::addr_of!(*info) as *const _,
-                    libc::CMSG_DATA(cmsg_hdr),
-                    std::mem::size_of::<SndInfo>(),
-                );
-                msghdr.msg_controllen = hlen;
-            }
-        }
+        cbuf.attach(&mut msghdr);
+        unsafe { write_sndinfo_cmsg(&mut msghdr, info) };
         let r = unsafe { libc::sendmsg(self.fd, &mut msghdr as *mut libc::msghdr, libc::MSG_DONTWAIT) };
         if r < 0 {
             Err(Error::last_os_error())
@@ -392,46 +380,36 @@ impl SctpSocket {
         }
     }
 
+    /// Receives user data. Notifications are consumed (and forwarded to the
+    /// notification queue, if one is set) instead of being returned as data.
     pub fn recvmsg(&self, data: &mut [u8]) -> Result<usize> {
-        let mut iovec_item = libc::iovec {
-            iov_base: data.as_ptr() as *mut libc::c_void,
-            iov_len: data.len(),
-        };
+        self.recvmsg_eor(data).map(|(n, _)| n)
+    }
 
-        //just take enough room on stack to avoid extra allocation
-        const SPACE: usize = 512;
-        let mut hbuffer = [0; SPACE];
-        //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
-        //let mut hbuffer = vec![0 as u8; space];
+    /// Like `recvmsg`, but also returns whether the data ends a message (MSG_EOR).
+    pub(crate) fn recvmsg_eor(&self, data: &mut [u8]) -> Result<(usize, bool)> {
+        loop {
+            let mut iovec_item = libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
+            };
 
-        // zeroed must be used to support linux-musl which has some private padding crap
-        let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
-        msghdr.msg_iov = &mut iovec_item;
-        msghdr.msg_iovlen = 1;
-        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
-        msghdr.msg_controllen = SPACE as _;
+            // zeroed must be used to support linux-musl which has some private padding crap
+            // no control buffer: ancillary data is not reported by this method
+            let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
+            msghdr.msg_iov = &mut iovec_item;
+            msghdr.msg_iovlen = 1;
 
-        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
-        if r < 0 {
-            Err(Error::last_os_error())
-        } else {
-            unsafe {
-                let mut cmsghdr = libc::CMSG_FIRSTHDR(&msghdr as *const libc::msghdr);
-                while !cmsghdr.is_null() {
-                    if (*cmsghdr).cmsg_level == libc::IPPROTO_SCTP {
-                        if (*cmsghdr).cmsg_type == SCTP_SNDRCV {
-                            //sndrcv info
-                            let data = libc::CMSG_DATA(cmsghdr);
-                            let _info = data as *mut SndRcvInfo;
-                            //println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
-                        }
-                        if (*cmsghdr).cmsg_type == SCTP_DSTADDRV4 {
-                        }
-                    }
-                    cmsghdr = libc::CMSG_NXTHDR(&msghdr as *const libc::msghdr, cmsghdr)
-                }
+            let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
+            if r < 0 {
+                return Err(Error::last_os_error());
             }
-            Ok(r as usize)
+            if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
+                self.handle_notification(&data[..r as usize], msghdr.msg_flags);
+                continue;
+            }
+            let eor = self.track_eor(r as usize, msghdr.msg_flags);
+            return Ok((r as usize, eor));
         }
     }
 
@@ -481,30 +459,31 @@ impl SctpSocket {
         }
     }
 
-    fn handle_notification(&self, data: &[u8]) {
-        let header = unsafe {
-            let header_ptr = data as *const _ as *const NotificationHeader;
-            &*header_ptr.cast::<NotificationHeader>()
-        };
-        if header.sn_type == 0x8002 {
-            let paddr = unsafe {
-                let paddr_ptr = data as *const _ as *const IPaddrChange;
-                &*paddr_ptr.cast::<IPaddrChange>()
-            };
-            unsafe {
-                let Some(dst) = OsSocketAddr::copy_from_raw(&paddr.spc_addr as *const _ as *const libc::sockaddr, 128).into_addr() else {
-                    // not an IPv4/IPv6 address
-                    return;
-                };
-                let n = NotificationAddress {
-                    addr: dst.to_socket_addrs().unwrap().next().unwrap(),
-                    state: paddr.spc_state,
-                    error: paddr.spc_error
-                };
-                let not = Notification::Address(n);
-                if let Some(q) = &self.notification_queue {
-                    let _ = q.try_send(not);
-                }
+    // Records whether a data read stopped mid-message. EOF (0 bytes) leaves it unchanged.
+    fn track_eor(&self, len: usize, msg_flags: libc::c_int) -> bool {
+        let eor = msg_flags & libc::MSG_EOR != 0;
+        if len > 0 {
+            self.data_partial.store(!eor, Ordering::Relaxed);
+        }
+        eor
+    }
+
+    /// True if the last data read ended mid-message.
+    pub(crate) fn in_partial_message(&self) -> bool {
+        self.data_partial.load(Ordering::Relaxed)
+    }
+
+    fn handle_notification(&self, data: &[u8], msg_flags: libc::c_int) {
+        // A notification larger than the read buffer arrives in pieces and only the
+        // last one has MSG_EOR. Drop all pieces rather than parse a fragment.
+        let complete = msg_flags & libc::MSG_EOR != 0;
+        let continued = self.notification_partial.swap(!complete, Ordering::Relaxed);
+        if continued || !complete {
+            return;
+        }
+        if let Some(q) = &self.notification_queue {
+            if let Some(not) = parse_notification(data) {
+                let _ = q.try_send(not);
             }
         }
     }
@@ -515,43 +494,111 @@ impl SctpSocket {
             iov_len: data.len(),
         };
 
-        //just take enough room on stack to avoid extra allocation
-        const SPACE: usize = 512;
-        let mut hbuffer = [0; SPACE];
-        //let space = unsafe { (libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo> as u32) ) as _ };
-        //let mut hbuffer = vec![0 as u8; space];
+        let mut cbuf = CmsgBuf::new();
 
         // zeroed must be used to support linux-musl which has some private padding crap
         let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
         msghdr.msg_iov = &mut iovec_item;
         msghdr.msg_iovlen = 1;
-        msghdr.msg_control = hbuffer.as_mut_ptr() as *mut libc::c_void;
-        msghdr.msg_controllen = SPACE as _;
+        cbuf.attach(&mut msghdr);
 
         let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
         if r < 0 {
             Err(Error::last_os_error())
         } else {
-            if msghdr.msg_flags & 0x8000 == 0x8000 {
-                self.handle_notification(data);
+            if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
+                self.handle_notification(&data[..r as usize], msghdr.msg_flags);
                 return Ok(0x99999999)
             }
-            unsafe {
-                let mut cmsghdr = libc::CMSG_FIRSTHDR(&msghdr as *const libc::msghdr);
-                while !cmsghdr.is_null() {
-                    if (*cmsghdr).cmsg_level == libc::IPPROTO_SCTP && (*cmsghdr).cmsg_type == SCTP_SNDRCV {
-                        //sndrcv info
-                        let data = libc::CMSG_DATA(cmsghdr);
-                        let _info = data as *mut SndRcvInfo;
-                        core::ptr::write(info, *_info);
-                        //println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
-                    }
-                    cmsghdr = libc::CMSG_NXTHDR(&msghdr as *const libc::msghdr, cmsghdr)
-                }
+            self.track_eor(r as usize, msghdr.msg_flags);
+            if let Some(i) = unsafe { read_sndrcv_cmsg(&msghdr) } {
+                *info = i;
             }
             Ok(r as usize)
         }
     }
+}
+
+// Control buffer for one SCTP cmsg. A plain byte (or i32) array doesn't have the
+// alignment cmsghdr needs, so writing the header through it would be UB.
+#[repr(C, align(8))]
+struct CmsgBuf([u8; 64]);
+
+const _: () = assert!(std::mem::align_of::<CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>());
+const _: () = assert!(
+    unsafe { libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo>() as u32) } as usize
+        <= std::mem::size_of::<CmsgBuf>()
+);
+
+impl CmsgBuf {
+    fn new() -> Self {
+        CmsgBuf([0; 64])
+    }
+    fn attach(&mut self, msghdr: &mut libc::msghdr) {
+        msghdr.msg_control = self.0.as_mut_ptr().cast();
+        msghdr.msg_controllen = self.0.len() as _;
+    }
+}
+
+/// Writes an SCTP_SNDINFO cmsg and shrinks msg_controllen to it.
+/// Safety: msg_control must point to an attached `CmsgBuf`.
+unsafe fn write_sndinfo_cmsg(msghdr: &mut libc::msghdr, info: &SndInfo) {
+    let cmsg = libc::CMSG_FIRSTHDR(msghdr);
+    if cmsg.is_null() {
+        return;
+    }
+    let hlen = libc::CMSG_LEN(std::mem::size_of::<SndInfo>() as u32) as _;
+    (*cmsg).cmsg_level = libc::IPPROTO_SCTP;
+    (*cmsg).cmsg_type = SCTP_SNDINFO;
+    (*cmsg).cmsg_len = hlen;
+    std::ptr::copy_nonoverlapping(
+        (info as *const SndInfo).cast::<u8>(),
+        libc::CMSG_DATA(cmsg),
+        std::mem::size_of::<SndInfo>(),
+    );
+    msghdr.msg_controllen = hlen;
+}
+
+/// Returns the SCTP_SNDRCV info from the control data that recvmsg filled in.
+/// Safety: msg_control must point to an attached `CmsgBuf`.
+unsafe fn read_sndrcv_cmsg(msghdr: &libc::msghdr) -> Option<SndRcvInfo> {
+    let need = libc::CMSG_LEN(std::mem::size_of::<SndRcvInfo>() as u32) as usize;
+    let mut cmsg = libc::CMSG_FIRSTHDR(msghdr);
+    while !cmsg.is_null() {
+        if (*cmsg).cmsg_level == libc::IPPROTO_SCTP
+            && (*cmsg).cmsg_type == SCTP_SNDRCV
+            && (*cmsg).cmsg_len as usize >= need
+        {
+            return Some(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast()));
+        }
+        cmsg = libc::CMSG_NXTHDR(msghdr, cmsg);
+    }
+    None
+}
+
+fn parse_notification(data: &[u8]) -> Option<Notification> {
+    // data has alignment 1, so the kernel structs are copied out with read_unaligned
+    if data.len() < std::mem::size_of::<NotificationHeader>() {
+        return None;
+    }
+    let header: NotificationHeader = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
+    if header.sn_type != SCTP_PEER_ADDR_CHANGE {
+        return None;
+    }
+    if data.len() < std::mem::size_of::<IPaddrChange>() {
+        return None;
+    }
+    let paddr: IPaddrChange = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
+    // None if not an IPv4/IPv6 address
+    let addr = unsafe {
+        OsSocketAddr::copy_from_raw(paddr.spc_addr.as_ptr().cast(), paddr.spc_addr.len() as _)
+    }
+    .into_addr()?;
+    Some(Notification::Address(NotificationAddress {
+        addr,
+        state: paddr.spc_state,
+        error: paddr.spc_error,
+    }))
 }
 
 impl Drop for SctpSocket {
@@ -569,14 +616,6 @@ impl AsRawFd for SctpSocket {
     }
 }
 
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> Result<usize> {
-    let rv = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if rv < 0 {
-        return Err(Error::last_os_error());
-    }
-    Ok(rv as usize)
-}
-
 /*
 fn write_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
     let rv = unsafe {
@@ -590,12 +629,12 @@ fn write_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
 
 impl std::io::Read for SctpSocket {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        read_fd(self.fd, buf)
+        self.recvmsg(buf)
     }
 }
 impl<'a> std::io::Read for &'a SctpSocket {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        read_fd(self.fd, buf)
+        self.recvmsg(buf)
     }
 }
 
@@ -619,5 +658,149 @@ impl<'a> std::io::Write for &'a SctpSocket {
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An SCTP_PEER_ADDR_CHANGE notification as the kernel delivers it.
+    fn paddr_change_bytes(addr: std::net::SocketAddr, state: u32, error: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&SCTP_PEER_ADDR_CHANGE.to_ne_bytes());
+        b.extend_from_slice(&0u16.to_ne_bytes());
+        b.extend_from_slice(&148u32.to_ne_bytes());
+        let mut storage = [0u8; 128];
+        let osa: OsSocketAddr = addr.into();
+        storage[..osa.as_ref().len()].copy_from_slice(osa.as_ref());
+        b.extend_from_slice(&storage);
+        b.extend_from_slice(&state.to_ne_bytes());
+        b.extend_from_slice(&error.to_ne_bytes());
+        b.extend_from_slice(&0i32.to_ne_bytes()); // spc_assoc_id
+        b
+    }
+
+    #[test]
+    fn parse_paddr_change_misaligned() {
+        let addr: std::net::SocketAddr = "10.0.1.2:3868".parse().unwrap();
+        // offset 1 makes every field misaligned
+        let mut buf = vec![0u8];
+        buf.extend(paddr_change_bytes(addr, 2, 7));
+        match parse_notification(&buf[1..]) {
+            Some(Notification::Address(n)) => {
+                assert_eq!(n.addr, addr);
+                assert_eq!(n.state, 2);
+                assert_eq!(n.error, 7);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_short_buffers() {
+        let addr: std::net::SocketAddr = "10.0.1.2:3868".parse().unwrap();
+        let bytes = paddr_change_bytes(addr, 2, 7);
+        for len in [0, 4, 8, 100, std::mem::size_of::<IPaddrChange>() - 1] {
+            assert!(parse_notification(&bytes[..len]).is_none(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn parse_other_type_ignored() {
+        let mut bytes = paddr_change_bytes("10.0.1.2:3868".parse().unwrap(), 2, 7);
+        bytes[..2].copy_from_slice(&0x8001u16.to_ne_bytes()); // SCTP_ASSOC_CHANGE
+        assert!(parse_notification(&bytes).is_none());
+    }
+
+    fn msghdr_with(cbuf: &mut CmsgBuf) -> libc::msghdr {
+        let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        cbuf.attach(&mut msghdr);
+        msghdr
+    }
+
+    #[test]
+    fn sndinfo_cmsg_layout() {
+        let info = SndInfo { snd_sid: 3, snd_flags: 0, snd_ppid: 46u32.to_be(), snd_context: 9, snd_assoc_id: 0 };
+        let mut cbuf = CmsgBuf::new();
+        let mut msghdr = msghdr_with(&mut cbuf);
+        unsafe { write_sndinfo_cmsg(&mut msghdr, &info) };
+
+        let hlen = unsafe { libc::CMSG_LEN(std::mem::size_of::<SndInfo>() as u32) } as usize;
+        assert_eq!(msghdr.msg_controllen as usize, hlen);
+        // raw pointer: a &cmsghdr would only cover the header, not the data after it
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msghdr) };
+        let (level, ty, len) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len as usize) };
+        assert_eq!((level, ty, len), (libc::IPPROTO_SCTP, SCTP_SNDINFO, hlen));
+        let sent: SndInfo = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast()) };
+        assert_eq!((sent.snd_sid, sent.snd_ppid, sent.snd_context), (3, 46u32.to_be(), 9));
+    }
+
+    // Writes a cmsg the way the kernel does on receive.
+    fn put_cmsg(msghdr: &mut libc::msghdr, cmsg_type: libc::c_int, cmsg_len: usize, info: SndRcvInfo) {
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(msghdr);
+            (*cmsg).cmsg_level = libc::IPPROTO_SCTP;
+            (*cmsg).cmsg_type = cmsg_type;
+            (*cmsg).cmsg_len = cmsg_len as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), info);
+            msghdr.msg_controllen = libc::CMSG_SPACE(std::mem::size_of::<SndRcvInfo>() as u32) as _;
+        }
+    }
+
+    #[test]
+    fn sndrcv_cmsg_parsed() {
+        let mut cbuf = CmsgBuf::new();
+        let mut msghdr = msghdr_with(&mut cbuf);
+        let len = unsafe { libc::CMSG_LEN(std::mem::size_of::<SndRcvInfo>() as u32) } as usize;
+        let info = SndRcvInfo { sinfo_stream: 2, sinfo_ppid: 46u32.to_be(), sinfo_tsn: 77, ..Default::default() };
+        put_cmsg(&mut msghdr, SCTP_SNDRCV, len, info);
+
+        let got = unsafe { read_sndrcv_cmsg(&msghdr) }.expect("SCTP_SNDRCV not found");
+        assert_eq!((got.sinfo_stream, got.sinfo_ppid, got.sinfo_tsn), (2, 46u32.to_be(), 77));
+    }
+
+    #[test]
+    fn sndrcv_cmsg_rejected() {
+        let len = unsafe { libc::CMSG_LEN(std::mem::size_of::<SndRcvInfo>() as u32) } as usize;
+        // cmsg_len too short for SndRcvInfo
+        let mut cbuf = CmsgBuf::new();
+        let mut msghdr = msghdr_with(&mut cbuf);
+        put_cmsg(&mut msghdr, SCTP_SNDRCV, len - 1, SndRcvInfo::default());
+        assert!(unsafe { read_sndrcv_cmsg(&msghdr) }.is_none());
+        // other cmsg type
+        let mut cbuf = CmsgBuf::new();
+        let mut msghdr = msghdr_with(&mut cbuf);
+        put_cmsg(&mut msghdr, SCTP_SNDINFO, len, SndRcvInfo::default());
+        assert!(unsafe { read_sndrcv_cmsg(&msghdr) }.is_none());
+        // no control data at all
+        let mut cbuf = CmsgBuf::new();
+        let mut msghdr = msghdr_with(&mut cbuf);
+        msghdr.msg_controllen = 0;
+        assert!(unsafe { read_sndrcv_cmsg(&msghdr) }.is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // needs a real socket
+    fn fragmented_notification_dropped() {
+        let addr: std::net::SocketAddr = "10.0.1.2:3868".parse().unwrap();
+        let bytes = paddr_change_bytes(addr, 2, 7);
+        let mut sock = SctpSocket::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        sock.subscribe_notifications(tx);
+
+        // pieces of one notification: only the last has MSG_EOR. The last piece
+        // starts at offset 144 but must not be parsed as a header.
+        sock.handle_notification(&bytes[..64], MSG_NOTIFICATION);
+        sock.handle_notification(&bytes[64..144], MSG_NOTIFICATION);
+        sock.handle_notification(&bytes[144..], MSG_NOTIFICATION | libc::MSG_EOR);
+        assert!(rx.try_recv().is_err());
+
+        // a later complete notification is delivered
+        sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
+        match rx.try_recv() {
+            Ok(Notification::Address(n)) => assert_eq!(n.addr, addr),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
