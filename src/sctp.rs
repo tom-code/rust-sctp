@@ -5,13 +5,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use os_socketaddr::OsSocketAddr;
 
 
+#[derive(Debug, Default)]
+struct PendingNotification {
+    buf: Vec<u8>,
+    overflow: bool,
+}
+
+// Largest notification that is reassembled from pieces; bigger ones are dropped.
+const MAX_NOTIFICATION: usize = 4096;
+
 #[derive(Debug)]
 pub struct SctpSocket {
     fd: RawFd,
     pub(crate) ppid: u32,
     notification_queue: Option<tokio::sync::mpsc::Sender<Notification>>,
-    // set while the pieces of a notification larger than the read buffer are being received
-    notification_partial: AtomicBool,
+    // pieces of a notification larger than the read buffer, collected until MSG_EOR
+    notification_pending: std::sync::Mutex<PendingNotification>,
     // set when the last data read ended without MSG_EOR, i.e. mid-message
     data_partial: AtomicBool,
 }
@@ -153,6 +162,22 @@ pub struct NotificationAddress {
     state: u32,
     error: u32
 }
+
+impl NotificationAddress {
+    /// The peer address whose state changed.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+    /// `spc_state`: SCTP_ADDR_AVAILABLE (0), SCTP_ADDR_UNREACHABLE (1), SCTP_ADDR_REMOVED (2),
+    /// SCTP_ADDR_ADDED (3), SCTP_ADDR_MADE_PRIM (4), SCTP_ADDR_CONFIRMED (5), ...
+    pub fn state(&self) -> u32 {
+        self.state
+    }
+    /// `spc_error`: the error cause, if any.
+    pub fn error(&self) -> u32 {
+        self.error
+    }
+}
 #[derive(Debug)]
 pub enum Notification {
     Address(NotificationAddress),
@@ -173,14 +198,14 @@ impl SctpSocket {
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
+        Ok(Self { fd, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
     }
     pub fn new6() -> Result<Self> {
         let fd = unsafe { libc::socket(libc::PF_INET6, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
+        Ok(Self { fd, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
     }
     pub fn set_ppid(&mut self, ppid: u32) {
         self.ppid = ppid;
@@ -293,7 +318,7 @@ impl SctpSocket {
             libc::connect(
                 self.fd.as_raw_fd(),
                 addrslice as *const _ as *const libc::sockaddr,
-                ossockaddr.len() as u32,
+                ossockaddr.len(),
             )
         })
     }
@@ -305,7 +330,7 @@ impl SctpSocket {
             libc::bind(
                 self.fd.as_raw_fd(),
                 addrslice as *const _ as *const libc::sockaddr,
-                ossockaddr.len() as u32,
+                ossockaddr.len(),
             )
         })
     }
@@ -325,7 +350,7 @@ impl SctpSocket {
         if r < 0 {
             return Err(Error::last_os_error());
         }
-        Ok(SctpSocket { fd: r, ppid: 0, notification_queue: None, notification_partial: AtomicBool::new(false), data_partial: AtomicBool::new(false) })
+        Ok(SctpSocket { fd: r, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
     }
 
     fn socketaddrlist_to_os(addresses: &[std::net::SocketAddr]) -> Vec<u8> {
@@ -439,7 +464,7 @@ impl SctpSocket {
         let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
         match osa.into_addr() {
             Some(addr) => Ok(addr),
-            None => Err(Error::new(std::io::ErrorKind::Other, "Invalid socket address")),
+            None => Err(Error::other("Invalid socket address")),
         }
     }
     pub fn getpeername(&self) -> Result<std::net::SocketAddr> {
@@ -455,7 +480,7 @@ impl SctpSocket {
         let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
         match osa.into_addr() {
             Some(addr) => Ok(addr),
-            None => Err(Error::new(std::io::ErrorKind::Other, "Invalid socket address")),
+            None => Err(Error::other("Invalid socket address")),
         }
     }
 
@@ -475,12 +500,30 @@ impl SctpSocket {
 
     fn handle_notification(&self, data: &[u8], msg_flags: libc::c_int) {
         // A notification larger than the read buffer arrives in pieces and only the
-        // last one has MSG_EOR. Drop all pieces rather than parse a fragment.
+        // last one has MSG_EOR, so the pieces are collected until then.
         let complete = msg_flags & libc::MSG_EOR != 0;
-        let continued = self.notification_partial.swap(!complete, Ordering::Relaxed);
-        if continued || !complete {
+        let mut pending = self.notification_pending.lock().unwrap_or_else(|e| e.into_inner());
+        if complete && pending.buf.is_empty() && !pending.overflow {
+            drop(pending);
+            self.deliver_notification(data);
             return;
         }
+        if pending.buf.len() + data.len() <= MAX_NOTIFICATION {
+            pending.buf.extend_from_slice(data);
+        } else {
+            // e.g. SCTP_SEND_FAILED carrying a large message; none we parse
+            pending.overflow = true;
+        }
+        if complete {
+            let p = std::mem::take(&mut *pending);
+            drop(pending);
+            if !p.overflow {
+                self.deliver_notification(&p.buf);
+            }
+        }
+    }
+
+    fn deliver_notification(&self, data: &[u8]) {
         if let Some(q) = &self.notification_queue {
             if let Some(not) = parse_notification(data) {
                 let _ = q.try_send(not);
@@ -632,7 +675,7 @@ impl std::io::Read for SctpSocket {
         self.recvmsg(buf)
     }
 }
-impl<'a> std::io::Read for &'a SctpSocket {
+impl std::io::Read for &SctpSocket {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.recvmsg(buf)
     }
@@ -649,7 +692,7 @@ impl std::io::Write for SctpSocket {
         Ok(())
     }
 }
-impl<'a> std::io::Write for &'a SctpSocket {
+impl std::io::Write for &SctpSocket {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         //write_fd(self.fd, buf)
         self.sendmsg_default(buf)
@@ -727,7 +770,9 @@ mod tests {
         unsafe { write_sndinfo_cmsg(&mut msghdr, &info) };
 
         let hlen = unsafe { libc::CMSG_LEN(std::mem::size_of::<SndInfo>() as u32) } as usize;
-        assert_eq!(msghdr.msg_controllen as usize, hlen);
+        #[allow(clippy::unnecessary_cast)] // msg_controllen is u32 on musl
+        let controllen = msghdr.msg_controllen as usize;
+        assert_eq!(controllen, hlen);
         // raw pointer: a &cmsghdr would only cover the header, not the data after it
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msghdr) };
         let (level, ty, len) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len as usize) };
@@ -782,25 +827,34 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore)] // needs a real socket
-    fn fragmented_notification_dropped() {
+    fn fragmented_notification_reassembled() {
         let addr: std::net::SocketAddr = "10.0.1.2:3868".parse().unwrap();
         let bytes = paddr_change_bytes(addr, 2, 7);
         let mut sock = SctpSocket::new().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         sock.subscribe_notifications(tx);
 
-        // pieces of one notification: only the last has MSG_EOR. The last piece
-        // starts at offset 144 but must not be parsed as a header.
+        // pieces of one notification, as read with a 64-byte buffer: only the last has MSG_EOR
         sock.handle_notification(&bytes[..64], MSG_NOTIFICATION);
-        sock.handle_notification(&bytes[64..144], MSG_NOTIFICATION);
-        sock.handle_notification(&bytes[144..], MSG_NOTIFICATION | libc::MSG_EOR);
+        sock.handle_notification(&bytes[64..128], MSG_NOTIFICATION);
         assert!(rx.try_recv().is_err());
-
-        // a later complete notification is delivered
-        sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
+        sock.handle_notification(&bytes[128..], MSG_NOTIFICATION | libc::MSG_EOR);
         match rx.try_recv() {
-            Ok(Notification::Address(n)) => assert_eq!(n.addr, addr),
+            Ok(Notification::Address(n)) => assert_eq!((n.addr, n.state, n.error), (addr, 2, 7)),
             other => panic!("unexpected {other:?}"),
         }
+
+        // a complete notification is delivered directly
+        sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
+        assert!(matches!(rx.try_recv(), Ok(Notification::Address(_))));
+
+        // an oversized notification is dropped, and the next one still works
+        let big = vec![0u8; MAX_NOTIFICATION];
+        sock.handle_notification(&bytes[..64], MSG_NOTIFICATION);
+        sock.handle_notification(&big, MSG_NOTIFICATION);
+        sock.handle_notification(&bytes[64..], MSG_NOTIFICATION | libc::MSG_EOR);
+        assert!(rx.try_recv().is_err());
+        sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
+        assert!(matches!(rx.try_recv(), Ok(Notification::Address(_))));
     }
 }

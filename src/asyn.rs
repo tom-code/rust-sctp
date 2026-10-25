@@ -25,7 +25,7 @@ impl AsyncRead for SctpSocketTokio {
     }
 }
 
-impl<'a> AsyncRead for &'a SctpSocketTokio {
+impl AsyncRead for &SctpSocketTokio {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -48,7 +48,7 @@ impl AsyncRead for ReadHalfSctp {
         self.inner.poll_read_priv(cx, buf)
     }
 }
-impl<'a> AsyncRead for &'a ReadHalfSctp {
+impl AsyncRead for &ReadHalfSctp {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
