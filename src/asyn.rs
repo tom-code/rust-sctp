@@ -178,7 +178,6 @@ impl SctpSocketTokio {
                     continue;
                 } else {
                     self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    println!("set to failed");
                     let _ = self.afd.get_ref().shutdown(std::net::Shutdown::Both);
                 }
             }
@@ -210,10 +209,8 @@ impl SctpSocketTokio {
             let mut guard = self.afd.readable().await?;
             let res = self.afd.get_ref().recvmsg_detailed_i(data, info);
             match &res {
-                Ok(0x99999999) => {
-                    guard.clear_ready();
-                    continue;
-                }
+                // notification consumed; more data may already be queued, so keep readiness
+                Ok(0x99999999) => continue,
                 Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
                     guard.clear_ready();
                     continue;
@@ -245,6 +242,9 @@ impl SctpSocketTokio {
     }
     pub fn subscribe_addr(&self) -> Result<()> {
         self.afd.get_ref().subscribe_addr()
+    }
+    pub fn subscribe_assoc(&self) -> Result<()> {
+        self.afd.get_ref().subscribe_assoc()
     }
 
     pub fn listen(&self, backlog: i32) -> Result<()> {

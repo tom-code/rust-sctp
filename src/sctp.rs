@@ -243,6 +243,12 @@ impl SctpSocket {
         events.sctp_address_event = 1;
         self.setsockopt(SOL_SCTP, SCTP_EVENTS, events)
     }
+    pub fn subscribe_assoc(&self) -> Result<()> {
+        let mut events = SctpEventSubscribe::default();
+        self.getsockopt(SOL_SCTP, SCTP_EVENTS, &mut events)?;
+        events.sctp_association_event = 1;
+        self.setsockopt(SOL_SCTP, SCTP_EVENTS, events)
+    }
     pub fn set_noblock(&self) -> Result<()> {
         let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
         if flags == -1 {
@@ -268,7 +274,7 @@ impl SctpSocket {
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
         if let Some(q) = &self.notification_queue {
-            q.try_send(Notification::Shutdown()).unwrap();
+            let _ = q.try_send(Notification::Shutdown());
         }
         handle_libc_error(unsafe { libc::shutdown(self.fd, flag) })
     }
@@ -279,7 +285,7 @@ impl SctpSocket {
             libc::connect(
                 self.fd.as_raw_fd(),
                 addrslice as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as u32,
+                ossockaddr.len() as u32,
             )
         })
     }
@@ -291,7 +297,7 @@ impl SctpSocket {
             libc::bind(
                 self.fd.as_raw_fd(),
                 addrslice as *const _ as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_in>() as u32,
+                ossockaddr.len() as u32,
             )
         })
     }
@@ -382,7 +388,7 @@ impl SctpSocket {
         if r < 0 {
             Err(Error::last_os_error())
         } else {
-            Ok(data.len())
+            Ok(r as usize)
         }
     }
 
@@ -420,7 +426,6 @@ impl SctpSocket {
                             //println!("rcv info! {} {}", u32::from_be((*_info).sinfo_ppid), (*_info).sinfo_stream);
                         }
                         if (*cmsghdr).cmsg_type == SCTP_DSTADDRV4 {
-                            println!("rcv info! dst");
                         }
                     }
                     cmsghdr = libc::CMSG_NXTHDR(&msghdr as *const libc::msghdr, cmsghdr)
@@ -481,19 +486,16 @@ impl SctpSocket {
             let header_ptr = data as *const _ as *const NotificationHeader;
             &*header_ptr.cast::<NotificationHeader>()
         };
-        println!("not {:?}", header);
         if header.sn_type == 0x8002 {
             let paddr = unsafe {
                 let paddr_ptr = data as *const _ as *const IPaddrChange;
                 &*paddr_ptr.cast::<IPaddrChange>()
             };
-            println!("not {:?}", paddr);
             unsafe {
                 let Some(dst) = OsSocketAddr::copy_from_raw(&paddr.spc_addr as *const _ as *const libc::sockaddr, 128).into_addr() else {
                     // not an IPv4/IPv6 address
                     return;
                 };
-                println!("dst {:?}", dst);
                 let n = NotificationAddress {
                     addr: dst.to_socket_addrs().unwrap().next().unwrap(),
                     state: paddr.spc_state,
@@ -501,7 +503,7 @@ impl SctpSocket {
                 };
                 let not = Notification::Address(n);
                 if let Some(q) = &self.notification_queue {
-                    q.try_send(not).unwrap();
+                    let _ = q.try_send(not);
                 }
             }
         }
