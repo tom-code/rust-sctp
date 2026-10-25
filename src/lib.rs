@@ -10,7 +10,7 @@
 //! ```no_run
 #![doc = include_str!("../examples/echo.rs")]
 //! ````
-//! 
+//!
 //! Simple sctp client:
 //! ```no_run
 #![doc = include_str!("../examples/client.rs")]

@@ -2,26 +2,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const BND: &str = "0.0.0.0:9999";
 
-
-async fn echoer<R: AsyncRead+Unpin, W: AsyncWrite+Unpin>(mut reader: R, mut writer: W) {
+async fn echoer<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(mut reader: R, mut writer: W) {
     loop {
-            let mut buffer = [0; 1024 * 10];
-            let received = reader.read(&mut buffer).await;
-            match received {
-                Err(e) => {
-                    println!("receive error = closing {}", e);
-                    break;
-                }
-                Ok(0) => {
-                    println!("got 0 bytes - closing");
-                    break;
-                }
-                Ok(len) => {
-                    println!("got data {}", len);
-                    let res = writer.write_all(&buffer[..len]).await;
-                    println!("send result: {:?}", res)
-                }
+        let mut buffer = [0; 1024 * 10];
+        let received = reader.read(&mut buffer).await;
+        match received {
+            Err(e) => {
+                println!("receive error = closing {}", e);
+                break;
             }
+            Ok(0) => {
+                println!("got 0 bytes - closing");
+                break;
+            }
+            Ok(len) => {
+                println!("got data {}", len);
+                let res = writer.write_all(&buffer[..len]).await;
+                println!("send result: {:?}", res)
+            }
+        }
     }
 }
 

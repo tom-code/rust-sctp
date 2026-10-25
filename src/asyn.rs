@@ -211,7 +211,10 @@ impl SctpSocketTokio {
                         if start == 0 {
                             return Ok(0);
                         }
-                        return Err(Error::new(std::io::ErrorKind::UnexpectedEof, "connection closed mid-message"));
+                        return Err(Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "connection closed mid-message",
+                        ));
                     }
                     if eor {
                         return Ok(msg.len());
@@ -299,7 +302,6 @@ impl SctpSocketTokio {
     pub fn getpeername(&self) -> Result<std::net::SocketAddr> {
         self.afd.get_ref().getpeername()
     }
-
 
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
         self.afd.get_ref().shutdown(how)

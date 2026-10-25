@@ -6,17 +6,16 @@ const REMOTE: &str = "127.0.0.1:9999";
 async fn main() {
     //connect
 
-    let (notification_queue_sender, mut notification_queue_receiver) = tokio::sync::mpsc::channel::<sctp::Notification>(32);
+    let (notification_queue_sender, mut notification_queue_receiver) =
+        tokio::sync::mpsc::channel::<sctp::Notification>(32);
     let notification_task = tokio::spawn(async move {
         'lo: loop {
             let notification = notification_queue_receiver.recv().await;
             println!("notification {:?}", notification);
             match notification {
-                Some(Notification::Shutdown()) => {
-                    break 'lo
-                },
-                Some(_) => {},
-                None => {},
+                Some(Notification::Shutdown()) => break 'lo,
+                Some(_) => {}
+                None => {}
             }
         }
     });
@@ -36,8 +35,9 @@ async fn main() {
                 assoc_id: 0,
                 srto_initial: 222,
                 srto_max: 333,
-                srto_min: 111 })
-                .unwrap();
+                srto_min: 111,
+            })
+            .unwrap();
         socket.set_rcvbuf(100000).unwrap();
 
         socket.subscribe_notifications(notification_queue_sender.clone());

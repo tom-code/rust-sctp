@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use os_socketaddr::OsSocketAddr;
 
-
 #[derive(Debug, Default)]
 struct PendingNotification {
     buf: Vec<u8>,
@@ -171,12 +170,11 @@ pub struct Status {
     //pub sstat_primary: Struct_sctp_paddrinfo,
 }
 
-
 #[derive(Debug)]
 pub struct NotificationAddress {
     addr: std::net::SocketAddr,
     state: u32,
-    error: u32
+    error: u32,
 }
 
 impl NotificationAddress {
@@ -197,7 +195,7 @@ impl NotificationAddress {
 #[derive(Debug)]
 pub enum Notification {
     Address(NotificationAddress),
-    Shutdown()
+    Shutdown(),
 }
 
 fn handle_libc_error(err: i32) -> Result<()> {
@@ -214,28 +212,38 @@ impl SctpSocket {
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
+        Ok(Self {
+            fd,
+            ppid: 0,
+            notification_queue: None,
+            notification_pending: Default::default(),
+            data_partial: AtomicBool::new(false),
+        })
     }
     pub fn new6() -> Result<Self> {
         let fd = unsafe { libc::socket(libc::PF_INET6, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
         if fd == -1 {
             return Err(Error::last_os_error());
         }
-        Ok(Self { fd, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
+        Ok(Self {
+            fd,
+            ppid: 0,
+            notification_queue: None,
+            notification_pending: Default::default(),
+            data_partial: AtomicBool::new(false),
+        })
     }
     pub fn set_ppid(&mut self, ppid: u32) {
         self.ppid = ppid;
     }
     fn setsockopt<T>(&self, level: libc::c_int, option: libc::c_int, value: T) -> Result<()> {
-        handle_libc_error(
-        unsafe {
+        handle_libc_error(unsafe {
             libc::setsockopt(
                 self.fd,
                 level,
                 option,
                 &value as *const T as *const libc::c_void,
-                std::mem::size_of_val(&value) as libc::socklen_t
-                //std::mem::size_of::<T>() as libc::socklen_t
+                std::mem::size_of_val(&value) as libc::socklen_t, //std::mem::size_of::<T>() as libc::socklen_t
             )
         })
     }
@@ -247,20 +255,23 @@ impl SctpSocket {
                 level,
                 option,
                 value as *const T as *mut T as *mut libc::c_void,
-                &mut n
-                //std::mem::size_of::<T>() as libc::socklen_t
+                &mut n, //std::mem::size_of::<T>() as libc::socklen_t
             )
         })
     }
-    fn setsockopt_slice(&self, level: libc::c_int, option: libc::c_int, value: &[u8]) -> Result<()> {
-        handle_libc_error(
-        unsafe {
+    fn setsockopt_slice(
+        &self,
+        level: libc::c_int,
+        option: libc::c_int,
+        value: &[u8],
+    ) -> Result<()> {
+        handle_libc_error(unsafe {
             libc::setsockopt(
                 self.fd,
                 level,
                 option,
                 value as *const _ as *const libc::c_void,
-                value.len() as libc::socklen_t
+                value.len() as libc::socklen_t,
             )
         })
     }
@@ -324,14 +335,20 @@ impl SctpSocket {
     pub fn set_primary_addr(&self, addr: std::net::SocketAddr) -> Result<()> {
         let osa: OsSocketAddr = addr.into();
         let raw = osa.as_ref();
-        let mut prim = Prim { ssp_assoc_id: 0, ssp_addr: [0; 128] };
+        let mut prim = Prim {
+            ssp_assoc_id: 0,
+            ssp_addr: [0; 128],
+        };
         prim.ssp_addr[..raw.len()].copy_from_slice(raw);
         self.setsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, prim)
     }
     /// The current primary peer address. It stays the same while the kernel
     /// sends over another path because the primary is unreachable.
     pub fn primary_addr(&self) -> Result<std::net::SocketAddr> {
-        let mut prim = Prim { ssp_assoc_id: 0, ssp_addr: [0; 128] };
+        let mut prim = Prim {
+            ssp_assoc_id: 0,
+            ssp_addr: [0; 128],
+        };
         self.getsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, &mut prim)?;
         let osa = unsafe {
             OsSocketAddr::copy_from_raw(prim.ssp_addr.as_ptr().cast(), prim.ssp_addr.len() as _)
@@ -389,7 +406,13 @@ impl SctpSocket {
         if r < 0 {
             return Err(Error::last_os_error());
         }
-        Ok(SctpSocket { fd: r, ppid: 0, notification_queue: None, notification_pending: Default::default(), data_partial: AtomicBool::new(false) })
+        Ok(SctpSocket {
+            fd: r,
+            ppid: 0,
+            notification_queue: None,
+            notification_pending: Default::default(),
+            data_partial: AtomicBool::new(false),
+        })
     }
 
     fn socketaddrlist_to_os(addresses: &[std::net::SocketAddr]) -> Vec<u8> {
@@ -484,7 +507,7 @@ impl SctpSocket {
             match r {
                 Ok(s) => {
                     if s != 0x99999999 {
-                        return r
+                        return r;
                     }
                 }
                 Err(_) => return r,
@@ -501,7 +524,9 @@ impl SctpSocket {
                 &mut len,
             )
         })?;
-        let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
+        let osa = unsafe {
+            OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)
+        };
         match osa.into_addr() {
             Some(addr) => Ok(addr),
             None => Err(Error::other("Invalid socket address")),
@@ -517,7 +542,9 @@ impl SctpSocket {
                 &mut len,
             )
         })?;
-        let osa = unsafe {OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)};
+        let osa = unsafe {
+            OsSocketAddr::copy_from_raw(&storage as *const _ as *const libc::sockaddr, len)
+        };
         match osa.into_addr() {
             Some(addr) => Ok(addr),
             None => Err(Error::other("Invalid socket address")),
@@ -542,7 +569,10 @@ impl SctpSocket {
         // A notification larger than the read buffer arrives in pieces and only the
         // last one has MSG_EOR, so the pieces are collected until then.
         let complete = msg_flags & libc::MSG_EOR != 0;
-        let mut pending = self.notification_pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .notification_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if complete && pending.buf.is_empty() && !pending.overflow {
             drop(pending);
             self.deliver_notification(data);
@@ -591,7 +621,7 @@ impl SctpSocket {
         } else {
             if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
                 self.handle_notification(&data[..r as usize], msghdr.msg_flags);
-                return Ok(0x99999999)
+                return Ok(0x99999999);
             }
             self.track_eor(r as usize, msghdr.msg_flags);
             if let Some(i) = unsafe { read_sndrcv_cmsg(&msghdr) } {
@@ -810,7 +840,13 @@ mod tests {
 
     #[test]
     fn sndinfo_cmsg_layout() {
-        let info = SndInfo { snd_sid: 3, snd_flags: 0, snd_ppid: 46u32.to_be(), snd_context: 9, snd_assoc_id: 0 };
+        let info = SndInfo {
+            snd_sid: 3,
+            snd_flags: 0,
+            snd_ppid: 46u32.to_be(),
+            snd_context: 9,
+            snd_assoc_id: 0,
+        };
         let mut cbuf = CmsgBuf::new();
         let mut msghdr = msghdr_with(&mut cbuf);
         unsafe { write_sndinfo_cmsg(&mut msghdr, &info) };
@@ -821,14 +857,28 @@ mod tests {
         assert_eq!(controllen, hlen);
         // raw pointer: a &cmsghdr would only cover the header, not the data after it
         let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msghdr) };
-        let (level, ty, len) = unsafe { ((*cmsg).cmsg_level, (*cmsg).cmsg_type, (*cmsg).cmsg_len as usize) };
+        let (level, ty, len) = unsafe {
+            (
+                (*cmsg).cmsg_level,
+                (*cmsg).cmsg_type,
+                (*cmsg).cmsg_len as usize,
+            )
+        };
         assert_eq!((level, ty, len), (libc::IPPROTO_SCTP, SCTP_SNDINFO, hlen));
         let sent: SndInfo = unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast()) };
-        assert_eq!((sent.snd_sid, sent.snd_ppid, sent.snd_context), (3, 46u32.to_be(), 9));
+        assert_eq!(
+            (sent.snd_sid, sent.snd_ppid, sent.snd_context),
+            (3, 46u32.to_be(), 9)
+        );
     }
 
     // Writes a cmsg the way the kernel does on receive.
-    fn put_cmsg(msghdr: &mut libc::msghdr, cmsg_type: libc::c_int, cmsg_len: usize, info: SndRcvInfo) {
+    fn put_cmsg(
+        msghdr: &mut libc::msghdr,
+        cmsg_type: libc::c_int,
+        cmsg_len: usize,
+        info: SndRcvInfo,
+    ) {
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(msghdr);
             (*cmsg).cmsg_level = libc::IPPROTO_SCTP;
@@ -844,11 +894,19 @@ mod tests {
         let mut cbuf = CmsgBuf::new();
         let mut msghdr = msghdr_with(&mut cbuf);
         let len = unsafe { libc::CMSG_LEN(std::mem::size_of::<SndRcvInfo>() as u32) } as usize;
-        let info = SndRcvInfo { sinfo_stream: 2, sinfo_ppid: 46u32.to_be(), sinfo_tsn: 77, ..Default::default() };
+        let info = SndRcvInfo {
+            sinfo_stream: 2,
+            sinfo_ppid: 46u32.to_be(),
+            sinfo_tsn: 77,
+            ..Default::default()
+        };
         put_cmsg(&mut msghdr, SCTP_SNDRCV, len, info);
 
         let got = unsafe { read_sndrcv_cmsg(&msghdr) }.expect("SCTP_SNDRCV not found");
-        assert_eq!((got.sinfo_stream, got.sinfo_ppid, got.sinfo_tsn), (2, 46u32.to_be(), 77));
+        assert_eq!(
+            (got.sinfo_stream, got.sinfo_ppid, got.sinfo_tsn),
+            (2, 46u32.to_be(), 77)
+        );
     }
 
     #[test]
