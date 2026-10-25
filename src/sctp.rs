@@ -33,6 +33,7 @@ const SCTP_SOCKOPT_CONNECTX: libc::c_int = 110;
 const SCTP_EVENTS: libc::c_int = 11;
 const SCTP_RTOINFO: i32 = 0;
 const SCTP_INIT_MSG: i32 = 2;
+const SCTP_PRIMARY_ADDR: libc::c_int = 6;
 
 // aux info
 //const SCTP_INIT: i32 = 0;
@@ -48,6 +49,14 @@ const SCTP_NODELAY: i32 = 3;
 // msg_flags bit set by the kernel when the received message is an SCTP notification
 const MSG_NOTIFICATION: libc::c_int = 0x8000;
 const SCTP_PEER_ADDR_CHANGE: u16 = 0x8002;
+
+// spc_state values of an address change notification
+pub const SCTP_ADDR_AVAILABLE: u32 = 0;
+pub const SCTP_ADDR_UNREACHABLE: u32 = 1;
+pub const SCTP_ADDR_REMOVED: u32 = 2;
+pub const SCTP_ADDR_ADDED: u32 = 3;
+pub const SCTP_ADDR_MADE_PRIM: u32 = 4;
+pub const SCTP_ADDR_CONFIRMED: u32 = 5;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -139,6 +148,13 @@ pub struct IPaddrChange {
     pub spc_addr: [u8; 128],
     pub spc_state: u32,
     pub spc_error: u32,
+}
+
+// struct sctp_prim: packed, aligned(4), so the address is kept as bytes
+#[repr(C)]
+struct Prim {
+    ssp_assoc_id: i32,
+    ssp_addr: [u8; 128],
 }
 
 #[repr(C)]
@@ -299,6 +315,29 @@ impl SctpSocket {
     }
     pub fn set_rto(&self, info: RtoInfo) -> Result<()> {
         self.setsockopt(SOL_SCTP, SCTP_RTOINFO, info)
+    }
+    /// Sets the peer address that data is sent to (SCTP_PRIMARY_ADDR). Call it once
+    /// the association is up; `addr` must be one of the peer's addresses (EINVAL
+    /// otherwise). On an IPv6 socket an IPv4 peer may need its v4-mapped form.
+    /// If the primary fails the kernel sends over another path, and returns to the
+    /// primary once it is reachable again (SCTP_ADDR_AVAILABLE).
+    pub fn set_primary_addr(&self, addr: std::net::SocketAddr) -> Result<()> {
+        let osa: OsSocketAddr = addr.into();
+        let raw = osa.as_ref();
+        let mut prim = Prim { ssp_assoc_id: 0, ssp_addr: [0; 128] };
+        prim.ssp_addr[..raw.len()].copy_from_slice(raw);
+        self.setsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, prim)
+    }
+    /// The current primary peer address. It stays the same while the kernel
+    /// sends over another path because the primary is unreachable.
+    pub fn primary_addr(&self) -> Result<std::net::SocketAddr> {
+        let mut prim = Prim { ssp_assoc_id: 0, ssp_addr: [0; 128] };
+        self.getsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, &mut prim)?;
+        let osa = unsafe {
+            OsSocketAddr::copy_from_raw(prim.ssp_addr.as_ptr().cast(), prim.ssp_addr.len() as _)
+        };
+        osa.into_addr()
+            .ok_or_else(|| Error::new(std::io::ErrorKind::InvalidData, "Invalid socket address"))
     }
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
         let flag = match how {
@@ -708,6 +747,12 @@ impl std::io::Write for &SctpSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prim_matches_kernel_layout() {
+        // the kernel rejects SCTP_PRIMARY_ADDR unless optlen == sizeof(struct sctp_prim)
+        assert_eq!(std::mem::size_of::<Prim>(), 132);
+    }
 
     // An SCTP_PEER_ADDR_CHANGE notification as the kernel delivers it.
     fn paddr_change_bytes(addr: std::net::SocketAddr, state: u32, error: u32) -> Vec<u8> {

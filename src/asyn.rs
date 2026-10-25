@@ -283,6 +283,13 @@ impl SctpSocketTokio {
     pub fn set_nodelay(&self, enable: bool) -> Result<()> {
         self.afd.get_ref().set_nodelay(enable)
     }
+    /// See [`SctpSocket::set_primary_addr`].
+    pub fn set_primary_addr(&self, addr: std::net::SocketAddr) -> Result<()> {
+        self.afd.get_ref().set_primary_addr(addr)
+    }
+    pub fn primary_addr(&self) -> Result<std::net::SocketAddr> {
+        self.afd.get_ref().primary_addr()
+    }
     pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
         self.afd.get_ref().set_rcvbuf(size)
     }

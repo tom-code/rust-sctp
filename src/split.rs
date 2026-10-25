@@ -37,6 +37,13 @@ impl WriteHalfSctp {
     pub async fn sendmsg(&self, data: &[u8], info: &SndInfo) -> Result<usize> {
         self.inner.sendmsg(data, info).await
     }
+    /// See [`SctpSocket::set_primary_addr`].
+    pub fn set_primary_addr(&self, addr: std::net::SocketAddr) -> Result<()> {
+        self.inner.set_primary_addr(addr)
+    }
+    pub fn primary_addr(&self) -> Result<std::net::SocketAddr> {
+        self.inner.primary_addr()
+    }
 }
 
 impl AsyncRead for ReadHalfSctp {
