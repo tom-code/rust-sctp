@@ -1,5 +1,3 @@
-use sctp::Notification;
-
 const REMOTE: &str = "127.0.0.1:9999";
 
 #[tokio::main]
@@ -8,15 +6,10 @@ async fn main() {
 
     let (notification_queue_sender, mut notification_queue_receiver) =
         tokio::sync::mpsc::channel::<sctp::Notification>(32);
+    // ends when the socket, which holds a sender, is dropped
     let notification_task = tokio::spawn(async move {
-        'lo: loop {
-            let notification = notification_queue_receiver.recv().await;
+        while let Some(notification) = notification_queue_receiver.recv().await {
             println!("notification {:?}", notification);
-            match notification {
-                Some(Notification::Shutdown()) => break 'lo,
-                Some(_) => {}
-                None => {}
-            }
         }
     });
 
@@ -40,7 +33,9 @@ async fn main() {
             .unwrap();
         socket.set_rcvbuf(100000).unwrap();
 
-        socket.subscribe_notifications(notification_queue_sender.clone());
+        socket
+            .subscribe(sctp::Events::all(), notification_queue_sender.clone())
+            .unwrap();
 
         let res = socket.connect(REMOTE.parse().unwrap()).await;
         match res {
@@ -51,21 +46,21 @@ async fn main() {
             Ok(connected) => break connected,
         }
     });
+    drop(notification_queue_sender);
     let connected2 = connected.clone();
 
-    // read all data and print number of read bytes
+    // read all data and print number of read bytes; this also processes the notifications
     let read_task = tokio::spawn(async move {
-        let mut info = sctp::SndRcvInfo::default();
         let mut buffer = [0; 1024 * 32];
         loop {
-            match connected2.recvmsg_detailed(&mut buffer, &mut info).await {
+            match connected2.recvmsg_detailed(&mut buffer).await {
                 Err(e) => {
                     println!("read error {:?}", e);
                     break;
                 }
-                Ok(d) => {
-                    println!("did read {:?} {:?}", d, info);
-                    if d == 0 {
+                Ok(info) => {
+                    println!("did read {:?}", info);
+                    if info.len == 0 {
                         break;
                     }
                 }
@@ -85,6 +80,7 @@ async fn main() {
     // then shutdown
     connected.shutdown(std::net::Shutdown::Both).unwrap();
     read_task.await.unwrap();
+    drop(connected);
     notification_task.await.unwrap();
     println!("read done");
 }

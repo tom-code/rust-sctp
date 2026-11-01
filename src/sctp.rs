@@ -1,6 +1,6 @@
 use std::io::{Error, Result};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use os_socketaddr::OsSocketAddr;
 
@@ -22,6 +22,8 @@ pub struct SctpSocket {
     notification_pending: std::sync::Mutex<PendingNotification>,
     // set when the last data read ended without MSG_EOR, i.e. mid-message
     data_partial: AtomicBool,
+    // notifications lost because the channel was full
+    notifications_dropped: AtomicU64,
 }
 
 const SOL_SCTP: libc::c_int = 132;
@@ -47,35 +49,86 @@ const SCTP_NODELAY: i32 = 3;
 
 // msg_flags bit set by the kernel when the received message is an SCTP notification
 const MSG_NOTIFICATION: libc::c_int = 0x8000;
+const SCTP_ASSOC_CHANGE: u16 = 0x8001;
 const SCTP_PEER_ADDR_CHANGE: u16 = 0x8002;
+const SCTP_SHUTDOWN_EVENT: u16 = 0x8005;
 
-// spc_state values of an address change notification
-pub const SCTP_ADDR_AVAILABLE: u32 = 0;
-pub const SCTP_ADDR_UNREACHABLE: u32 = 1;
-pub const SCTP_ADDR_REMOVED: u32 = 2;
-pub const SCTP_ADDR_ADDED: u32 = 3;
-pub const SCTP_ADDR_MADE_PRIM: u32 = 4;
-pub const SCTP_ADDR_CONFIRMED: u32 = 5;
+/// Send a message unordered (`snd_flags`); also reported as [`RecvInfo::unordered`].
+pub const SCTP_UNORDERED: u16 = 1;
 
+// struct sctp_sndrcvinfo as the kernel fills it in: sinfo_ppid is in network order
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
-pub struct SndRcvInfo {
-    pub sinfo_stream: u16,
-    pub sinfo_ssn: u16,
-    pub sinfo_flags: u16,
-    pub sinfo_ppid: u32,
-    pub sinfo_context: u32,
-    pub sinfo_timetolive: u32,
-    pub sinfo_tsn: u32,
-    pub sinfo_cumtsn: u32,
-    pub sinfo_assoc_id: i32,
+struct SndRcvInfo {
+    sinfo_stream: u16,
+    sinfo_ssn: u16,
+    sinfo_flags: u16,
+    sinfo_ppid: u32,
+    sinfo_context: u32,
+    sinfo_timetolive: u32,
+    sinfo_tsn: u32,
+    sinfo_cumtsn: u32,
+    sinfo_assoc_id: i32,
 }
 
+/// What [`SctpSocket::recvmsg_detailed`] received.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecvInfo {
+    /// Bytes written to the buffer. 0 means the peer closed, or the buffer was
+    /// empty; all other fields are then zero.
+    pub len: usize,
+    pub stream: u16,
+    pub ssn: u16,
+    /// Payload protocol identifier, in host order.
+    pub ppid: u32,
+    pub unordered: bool,
+    /// This read ends a message. False means the rest follows in later reads.
+    pub eor: bool,
+    pub tsn: u32,
+    pub cumtsn: u32,
+    pub context: u32,
+}
+
+/// Converts what one read returned to the public form, with the PPID in host order.
+fn recv_info(len: usize, msg_flags: libc::c_int, raw: Option<SndRcvInfo>) -> Result<RecvInfo> {
+    if len == 0 {
+        return Ok(RecvInfo::default());
+    }
+    // every socket enables this info when it is created, so only a change made
+    // through the raw fd gets here
+    let raw = raw.ok_or_else(|| {
+        Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SCTP_SNDRCV info missing: sctp_data_io_event was disabled on this socket",
+        )
+    })?;
+    Ok(RecvInfo {
+        len,
+        stream: raw.sinfo_stream,
+        ssn: raw.sinfo_ssn,
+        ppid: u32::from_be(raw.sinfo_ppid),
+        unordered: raw.sinfo_flags & SCTP_UNORDERED != 0,
+        eor: msg_flags & libc::MSG_EOR != 0,
+        tsn: raw.sinfo_tsn,
+        cumtsn: raw.sinfo_cumtsn,
+        context: raw.sinfo_context,
+    })
+}
+
+// One recvmsg of user data.
+struct Received {
+    len: usize,
+    msg_flags: libc::c_int,
+    info: Option<SndRcvInfo>,
+}
+
+/// Send parameters. All values are in host order, including `snd_ppid`.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct SndInfo {
     pub snd_sid: u16,
     pub snd_flags: u16,
+    /// Payload protocol identifier, in host order.
     pub snd_ppid: u32,
     pub snd_context: u32,
     pub snd_assoc_id: i32,
@@ -132,21 +185,46 @@ struct SctpEventSubscribe {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct NotificationHeader {
-    pub sn_type: u16,
-    pub sn_flags: u16,
-    pub sn_length: u32,
+struct NotificationHeader {
+    sn_type: u16,
+    sn_flags: u16,
+    sn_length: u32,
 }
 
+// struct sctp_paddr_change, without the trailing spc_assoc_id
 #[repr(C)]
 #[derive(Debug)]
-pub struct IPaddrChange {
-    pub spc_type: u16,
-    pub spc_flags: u16,
-    pub spc_length: u32,
-    pub spc_addr: [u8; 128],
-    pub spc_state: u32,
-    pub spc_error: u32,
+struct IPaddrChange {
+    spc_type: u16,
+    spc_flags: u16,
+    spc_length: u32,
+    spc_addr: [u8; 128],
+    spc_state: u32,
+    spc_error: u32,
+}
+
+// struct sctp_assoc_change, without the variable-length sac_info
+#[repr(C)]
+#[derive(Debug)]
+struct RawAssocChange {
+    sac_type: u16,
+    sac_flags: u16,
+    sac_length: u32,
+    sac_state: u16,
+    sac_error: u16,
+    sac_outbound_streams: u16,
+    sac_inbound_streams: u16,
+    sac_assoc_id: i32,
+}
+
+// struct sctp_shutdown_event
+#[repr(C)]
+#[derive(Debug)]
+struct RawShutdownEvent {
+    sse_type: u16,
+    sse_flags: u16,
+    sse_length: u32,
+    sse_assoc_id: i32,
 }
 
 // struct sctp_prim: packed, aligned(4), so the address is kept as bytes
@@ -170,32 +248,113 @@ pub struct Status {
     //pub sstat_primary: Struct_sctp_paddrinfo,
 }
 
-#[derive(Debug)]
-pub struct NotificationAddress {
-    addr: std::net::SocketAddr,
-    state: u32,
-    error: u32,
+/// The events to receive, see [`SctpSocket::subscribe`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Events {
+    /// Association state changes, [`Notification::AssocChange`].
+    pub assoc: bool,
+    /// Peer address state changes, [`Notification::PeerAddrChange`].
+    pub peer_addr: bool,
+    /// The peer started a shutdown, [`Notification::Shutdown`].
+    pub shutdown: bool,
 }
 
-impl NotificationAddress {
-    /// The peer address whose state changed.
-    pub fn addr(&self) -> std::net::SocketAddr {
-        self.addr
-    }
-    /// `spc_state`: SCTP_ADDR_AVAILABLE (0), SCTP_ADDR_UNREACHABLE (1), SCTP_ADDR_REMOVED (2),
-    /// SCTP_ADDR_ADDED (3), SCTP_ADDR_MADE_PRIM (4), SCTP_ADDR_CONFIRMED (5), ...
-    pub fn state(&self) -> u32 {
-        self.state
-    }
-    /// `spc_error`: the error cause, if any.
-    pub fn error(&self) -> u32 {
-        self.error
+impl Events {
+    pub fn all() -> Self {
+        Events {
+            assoc: true,
+            peer_addr: true,
+            shutdown: true,
+        }
     }
 }
-#[derive(Debug)]
+
+/// An event reported by the kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Notification {
-    Address(NotificationAddress),
-    Shutdown(),
+    AssocChange(AssocChange),
+    PeerAddrChange(PeerAddrChange),
+    /// The peer sent SHUTDOWN. It accepts no more data; a local shutdown
+    /// doesn't produce this event.
+    Shutdown,
+}
+
+/// SCTP_ASSOC_CHANGE: the association changed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssocChange {
+    pub state: AssocState,
+    /// `sac_error`: the error cause, if any.
+    pub error: u16,
+    pub outbound_streams: u16,
+    pub inbound_streams: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssocState {
+    /// The association is up.
+    CommUp,
+    /// The association failed: the peer aborted, or it can't be reached.
+    CommLost,
+    /// The peer restarted. The association stays up, with a new peer instance.
+    Restart,
+    /// A graceful shutdown finished.
+    ShutdownComplete,
+    /// The association couldn't be set up.
+    CantStartAssoc,
+    /// A state this crate doesn't know.
+    Other(u16),
+}
+
+impl AssocState {
+    fn from_raw(state: u16) -> Self {
+        match state {
+            0 => AssocState::CommUp,
+            1 => AssocState::CommLost,
+            2 => AssocState::Restart,
+            3 => AssocState::ShutdownComplete,
+            4 => AssocState::CantStartAssoc,
+            other => AssocState::Other(other),
+        }
+    }
+}
+
+/// SCTP_PEER_ADDR_CHANGE: a peer address changed state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerAddrChange {
+    /// The peer address whose state changed.
+    pub addr: std::net::SocketAddr,
+    pub state: PeerAddrState,
+    /// `spc_error`: the error cause, if any.
+    pub error: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAddrState {
+    Available,
+    Unreachable,
+    Removed,
+    Added,
+    MadePrimary,
+    Confirmed,
+    PotentiallyFailed,
+    /// A state this crate doesn't know.
+    Other(u32),
+}
+
+impl PeerAddrState {
+    fn from_raw(state: u32) -> Self {
+        match state {
+            0 => PeerAddrState::Available,
+            1 => PeerAddrState::Unreachable,
+            2 => PeerAddrState::Removed,
+            3 => PeerAddrState::Added,
+            4 => PeerAddrState::MadePrimary,
+            5 => PeerAddrState::Confirmed,
+            6 => PeerAddrState::PotentiallyFailed,
+            other => PeerAddrState::Other(other),
+        }
+    }
 }
 
 fn handle_libc_error(err: i32) -> Result<()> {
@@ -207,32 +366,33 @@ fn handle_libc_error(err: i32) -> Result<()> {
 }
 
 impl SctpSocket {
-    pub fn new() -> Result<Self> {
-        let fd = unsafe { libc::socket(libc::PF_INET, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
-        if fd == -1 {
-            return Err(Error::last_os_error());
-        }
-        Ok(Self {
+    fn from_fd(fd: RawFd) -> Self {
+        Self {
             fd,
             ppid: 0,
             notification_queue: None,
             notification_pending: Default::default(),
             data_partial: AtomicBool::new(false),
-        })
+            notifications_dropped: AtomicU64::new(0),
+        }
+    }
+    fn with_domain(domain: libc::c_int) -> Result<Self> {
+        let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
+        if fd == -1 {
+            return Err(Error::last_os_error());
+        }
+        // from here on Drop closes the fd, also if set_events fails
+        let sock = Self::from_fd(fd);
+        sock.set_events(Events::default())?;
+        Ok(sock)
+    }
+    pub fn new() -> Result<Self> {
+        Self::with_domain(libc::PF_INET)
     }
     pub fn new6() -> Result<Self> {
-        let fd = unsafe { libc::socket(libc::PF_INET6, libc::SOCK_STREAM, libc::IPPROTO_SCTP) };
-        if fd == -1 {
-            return Err(Error::last_os_error());
-        }
-        Ok(Self {
-            fd,
-            ppid: 0,
-            notification_queue: None,
-            notification_pending: Default::default(),
-            data_partial: AtomicBool::new(false),
-        })
+        Self::with_domain(libc::PF_INET6)
     }
+    /// Sets the PPID that `sendmsg_default` and `Write` send, in host order.
     pub fn set_ppid(&mut self, ppid: u32) {
         self.ppid = ppid;
     }
@@ -282,32 +442,49 @@ impl SctpSocket {
         };
         self.setsockopt(SOL_SCTP, SCTP_NODELAY, opt)
     }
-    pub fn subscribe_notifications(&mut self, s: tokio::sync::mpsc::Sender<Notification>) {
-        self.notification_queue = Some(s);
+    // sctp_data_io_event is always on, so every read can report its SCTP_SNDRCV info
+    fn set_events(&self, events: Events) -> Result<()> {
+        let subscribe = SctpEventSubscribe {
+            sctp_data_io_event: 1,
+            sctp_association_event: events.assoc as u8,
+            sctp_address_event: events.peer_addr as u8,
+            sctp_shutdown_event: events.shutdown as u8,
+            ..Default::default()
+        };
+        self.setsockopt(SOL_SCTP, SCTP_EVENTS, subscribe)
+    }
+    /// Sends the selected kernel events to `tx`. A second call replaces both.
+    ///
+    /// - Events are only processed while something reads from the socket, so a
+    ///   send-only user needs a reader task to see them.
+    /// - An event that doesn't fit in the channel is lost and counted by
+    ///   [`SctpSocket::dropped_notifications`].
+    /// - Events aren't ordered relative to the data that the reads return.
+    /// - An accepted socket inherits the selected events from the listener, but
+    ///   not the channel. Call `subscribe` on it before its first read; events
+    ///   that are already queued (e.g. `CommUp`) wait in the kernel until then.
+    /// - A failed connect is reported by its `Err`, not by an event, because
+    ///   the socket is closed before anything can read the event.
+    /// - `ShutdownComplete` can arrive after a read returned 0, so a reader
+    ///   that stops at EOF may miss it.
+    pub fn subscribe(
+        &mut self,
+        events: Events,
+        tx: tokio::sync::mpsc::Sender<Notification>,
+    ) -> Result<()> {
+        self.set_events(events)?;
+        self.notification_queue = Some(tx);
+        Ok(())
+    }
+    /// How many notifications were lost because the channel was full.
+    pub fn dropped_notifications(&self) -> u64 {
+        self.notifications_dropped.load(Ordering::Relaxed)
     }
     pub fn set_snfbuf(&self, size: i32) -> Result<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_SNDBUF, size)
     }
     pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_RCVBUF, size)
-    }
-    pub fn subscribe_aux(&self) -> Result<()> {
-        let mut events = SctpEventSubscribe::default();
-        self.getsockopt(SOL_SCTP, SCTP_EVENTS, &mut events)?;
-        events.sctp_data_io_event = 1;
-        self.setsockopt(SOL_SCTP, SCTP_EVENTS, events)
-    }
-    pub fn subscribe_addr(&self) -> Result<()> {
-        let mut events = SctpEventSubscribe::default();
-        self.getsockopt(SOL_SCTP, SCTP_EVENTS, &mut events)?;
-        events.sctp_address_event = 1;
-        self.setsockopt(SOL_SCTP, SCTP_EVENTS, events)
-    }
-    pub fn subscribe_assoc(&self) -> Result<()> {
-        let mut events = SctpEventSubscribe::default();
-        self.getsockopt(SOL_SCTP, SCTP_EVENTS, &mut events)?;
-        events.sctp_association_event = 1;
-        self.setsockopt(SOL_SCTP, SCTP_EVENTS, events)
     }
     pub fn set_noblock(&self) -> Result<()> {
         let flags = unsafe { libc::fcntl(self.fd, libc::F_GETFL) };
@@ -362,9 +539,6 @@ impl SctpSocket {
             std::net::Shutdown::Read => libc::SHUT_RD,
             std::net::Shutdown::Both => libc::SHUT_RDWR,
         };
-        if let Some(q) = &self.notification_queue {
-            let _ = q.try_send(Notification::Shutdown());
-        }
         handle_libc_error(unsafe { libc::shutdown(self.fd, flag) })
     }
     pub fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
@@ -406,13 +580,8 @@ impl SctpSocket {
         if r < 0 {
             return Err(Error::last_os_error());
         }
-        Ok(SctpSocket {
-            fd: r,
-            ppid: 0,
-            notification_queue: None,
-            notification_pending: Default::default(),
-            data_partial: AtomicBool::new(false),
-        })
+        // the selected events, including sctp_data_io_event, are inherited
+        Ok(Self::from_fd(r))
     }
 
     fn socketaddrlist_to_os(addresses: &[std::net::SocketAddr]) -> Vec<u8> {
@@ -436,16 +605,14 @@ impl SctpSocket {
     }
 
     pub fn sendmsg_default(&self, data: &[u8]) -> Result<usize> {
-        let info: SndInfo = SndInfo {
-            snd_sid: 0,
-            snd_flags: 0,
-            snd_ppid: self.ppid.to_be(),
-            snd_context: 0,
-            snd_assoc_id: 0,
+        let info = SndInfo {
+            snd_ppid: self.ppid,
+            ..Default::default()
         };
         self.sendmsg(data, &info)
     }
 
+    /// Sends one message. `info.snd_ppid` is in host order.
     pub fn sendmsg(&self, data: &[u8], info: &SndInfo) -> Result<usize> {
         let mut iovec_item = libc::iovec {
             iov_base: data.as_ptr() as *mut libc::c_void,
@@ -478,50 +645,71 @@ impl SctpSocket {
 
     /// Like `recvmsg`, but also returns whether the data ends a message (MSG_EOR).
     pub(crate) fn recvmsg_eor(&self, data: &mut [u8]) -> Result<(usize, bool)> {
-        // a queued notification can't be consumed into an empty buffer, so the
-        // loop below would never make progress
-        if data.is_empty() {
-            return Ok((0, false));
-        }
         loop {
-            let mut iovec_item = libc::iovec {
-                iov_base: data.as_ptr() as *mut libc::c_void,
-                iov_len: data.len(),
-            };
-
-            // zeroed must be used to support linux-musl which has some private padding crap
-            // no control buffer: ancillary data is not reported by this method
-            let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
-            msghdr.msg_iov = &mut iovec_item;
-            msghdr.msg_iovlen = 1;
-
-            let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
-            if r < 0 {
-                return Err(Error::last_os_error());
+            if let Some(r) = self.recv_once(data)? {
+                return Ok((r.len, r.msg_flags & libc::MSG_EOR != 0));
             }
-            if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
-                self.handle_notification(&data[..r as usize], msghdr.msg_flags);
-                continue;
-            }
-            let eor = self.track_eor(r as usize, msghdr.msg_flags);
-            return Ok((r as usize, eor));
         }
     }
 
-    /// Receives user data and its SCTP_SNDRCV info. An empty `data` returns
-    /// `Ok(0)` without reading, which isn't EOF there.
-    pub fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
+    /// Receives user data and reports its stream, PPID and so on. See
+    /// [`RecvInfo`]. Notifications are consumed as in `recvmsg`.
+    ///
+    /// An empty `data` returns a zero `len` without reading, which isn't EOF there.
+    pub fn recvmsg_detailed(&self, data: &mut [u8]) -> Result<RecvInfo> {
         loop {
-            let r = self.recvmsg_detailed_i(data, info);
-            match r {
-                Ok(s) => {
-                    if s != 0x99999999 {
-                        return r;
-                    }
-                }
-                Err(_) => return r,
+            if let Some(info) = self.recvmsg_detailed_once(data)? {
+                return Ok(info);
             }
         }
+    }
+
+    /// One read for `recvmsg_detailed`; `None` means it consumed a notification.
+    pub(crate) fn recvmsg_detailed_once(&self, data: &mut [u8]) -> Result<Option<RecvInfo>> {
+        self.recv_once(data)?
+            .map(|r| recv_info(r.len, r.msg_flags, r.info))
+            .transpose()
+    }
+
+    // One recvmsg. `None` means it consumed a notification, or a piece of one.
+    fn recv_once(&self, data: &mut [u8]) -> Result<Option<Received>> {
+        // a queued notification can't be consumed into an empty buffer, so a
+        // caller retrying it would never make progress
+        if data.is_empty() {
+            return Ok(Some(Received {
+                len: 0,
+                msg_flags: 0,
+                info: None,
+            }));
+        }
+        let mut iovec_item = libc::iovec {
+            iov_base: data.as_mut_ptr().cast(),
+            iov_len: data.len(),
+        };
+
+        let mut cbuf = CmsgBuf::new();
+
+        // zeroed must be used to support linux-musl which has some private padding crap
+        let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        msghdr.msg_iov = &mut iovec_item;
+        msghdr.msg_iovlen = 1;
+        cbuf.attach(&mut msghdr);
+
+        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
+        if r < 0 {
+            return Err(Error::last_os_error());
+        }
+        let len = r as usize;
+        if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
+            self.handle_notification(&data[..len], msghdr.msg_flags);
+            return Ok(None);
+        }
+        self.track_eor(len, msghdr.msg_flags);
+        Ok(Some(Received {
+            len,
+            msg_flags: msghdr.msg_flags,
+            info: unsafe { read_sndrcv_cmsg(&msghdr) },
+        }))
     }
     /// Reads and clears the pending socket error (SO_ERROR).
     pub(crate) fn take_error(&self) -> Result<Option<Error>> {
@@ -567,12 +755,11 @@ impl SctpSocket {
     }
 
     // Records whether a data read stopped mid-message. EOF (0 bytes) leaves it unchanged.
-    fn track_eor(&self, len: usize, msg_flags: libc::c_int) -> bool {
-        let eor = msg_flags & libc::MSG_EOR != 0;
+    fn track_eor(&self, len: usize, msg_flags: libc::c_int) {
         if len > 0 {
-            self.data_partial.store(!eor, Ordering::Relaxed);
+            self.data_partial
+                .store(msg_flags & libc::MSG_EOR == 0, Ordering::Relaxed);
         }
-        eor
     }
 
     /// True if the last data read ended mid-message.
@@ -609,44 +796,14 @@ impl SctpSocket {
     }
 
     fn deliver_notification(&self, data: &[u8]) {
-        if let Some(q) = &self.notification_queue {
-            if let Some(not) = parse_notification(data) {
-                let _ = q.try_send(not);
-            }
-        }
-    }
-
-    pub fn recvmsg_detailed_i(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
-        // see recvmsg_eor: callers would retry a notification forever
-        if data.is_empty() {
-            return Ok(0);
-        }
-        let mut iovec_item = libc::iovec {
-            iov_base: data.as_ptr() as *mut libc::c_void,
-            iov_len: data.len(),
+        let Some(q) = &self.notification_queue else {
+            return;
         };
-
-        let mut cbuf = CmsgBuf::new();
-
-        // zeroed must be used to support linux-musl which has some private padding crap
-        let mut msghdr: libc::msghdr = unsafe { std::mem::zeroed() };
-        msghdr.msg_iov = &mut iovec_item;
-        msghdr.msg_iovlen = 1;
-        cbuf.attach(&mut msghdr);
-
-        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
-        if r < 0 {
-            Err(Error::last_os_error())
-        } else {
-            if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
-                self.handle_notification(&data[..r as usize], msghdr.msg_flags);
-                return Ok(0x99999999);
-            }
-            self.track_eor(r as usize, msghdr.msg_flags);
-            if let Some(i) = unsafe { read_sndrcv_cmsg(&msghdr) } {
-                *info = i;
-            }
-            Ok(r as usize)
+        let Some(not) = parse_notification(data) else {
+            return;
+        };
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = q.try_send(not) {
+            self.notifications_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -672,7 +829,8 @@ impl CmsgBuf {
     }
 }
 
-/// Writes an SCTP_SNDINFO cmsg and shrinks msg_controllen to it.
+/// Writes an SCTP_SNDINFO cmsg, with the PPID in network order, and shrinks
+/// msg_controllen to it.
 /// Safety: msg_control must point to an attached `CmsgBuf`.
 unsafe fn write_sndinfo_cmsg(msghdr: &mut libc::msghdr, info: &SndInfo) {
     let cmsg = libc::CMSG_FIRSTHDR(msghdr);
@@ -683,8 +841,12 @@ unsafe fn write_sndinfo_cmsg(msghdr: &mut libc::msghdr, info: &SndInfo) {
     (*cmsg).cmsg_level = libc::IPPROTO_SCTP;
     (*cmsg).cmsg_type = SCTP_SNDINFO;
     (*cmsg).cmsg_len = hlen;
+    let wire = SndInfo {
+        snd_ppid: info.snd_ppid.to_be(),
+        ..*info
+    };
     std::ptr::copy_nonoverlapping(
-        (info as *const SndInfo).cast::<u8>(),
+        (&wire as *const SndInfo).cast::<u8>(),
         libc::CMSG_DATA(cmsg),
         std::mem::size_of::<SndInfo>(),
     );
@@ -708,29 +870,47 @@ unsafe fn read_sndrcv_cmsg(msghdr: &libc::msghdr) -> Option<SndRcvInfo> {
     None
 }
 
+/// Copies a kernel struct out of `data`, which has alignment 1. `None` if too short.
+/// Safety: every bit pattern must be valid for `T`.
+unsafe fn read_struct<T>(data: &[u8]) -> Option<T> {
+    (data.len() >= std::mem::size_of::<T>()).then(|| std::ptr::read_unaligned(data.as_ptr().cast()))
+}
+
 fn parse_notification(data: &[u8]) -> Option<Notification> {
-    // data has alignment 1, so the kernel structs are copied out with read_unaligned
-    if data.len() < std::mem::size_of::<NotificationHeader>() {
-        return None;
+    // Safety: these repr(C) structs only hold integers and integer arrays
+    let header: NotificationHeader = unsafe { read_struct(data) }?;
+    match header.sn_type {
+        SCTP_ASSOC_CHANGE => {
+            let change: RawAssocChange = unsafe { read_struct(data) }?;
+            Some(Notification::AssocChange(AssocChange {
+                state: AssocState::from_raw(change.sac_state),
+                error: change.sac_error,
+                outbound_streams: change.sac_outbound_streams,
+                inbound_streams: change.sac_inbound_streams,
+            }))
+        }
+        SCTP_PEER_ADDR_CHANGE => {
+            let paddr: IPaddrChange = unsafe { read_struct(data) }?;
+            // None if not an IPv4/IPv6 address
+            let addr = unsafe {
+                OsSocketAddr::copy_from_raw(
+                    paddr.spc_addr.as_ptr().cast(),
+                    paddr.spc_addr.len() as _,
+                )
+            }
+            .into_addr()?;
+            Some(Notification::PeerAddrChange(PeerAddrChange {
+                addr,
+                state: PeerAddrState::from_raw(paddr.spc_state),
+                error: paddr.spc_error,
+            }))
+        }
+        SCTP_SHUTDOWN_EVENT => {
+            let _: RawShutdownEvent = unsafe { read_struct(data) }?;
+            Some(Notification::Shutdown)
+        }
+        _ => None,
     }
-    let header: NotificationHeader = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
-    if header.sn_type != SCTP_PEER_ADDR_CHANGE {
-        return None;
-    }
-    if data.len() < std::mem::size_of::<IPaddrChange>() {
-        return None;
-    }
-    let paddr: IPaddrChange = unsafe { std::ptr::read_unaligned(data.as_ptr().cast()) };
-    // None if not an IPv4/IPv6 address
-    let addr = unsafe {
-        OsSocketAddr::copy_from_raw(paddr.spc_addr.as_ptr().cast(), paddr.spc_addr.len() as _)
-    }
-    .into_addr()?;
-    Some(Notification::Address(NotificationAddress {
-        addr,
-        state: paddr.spc_state,
-        error: paddr.spc_error,
-    }))
 }
 
 impl Drop for SctpSocket {
@@ -826,9 +1006,9 @@ mod tests {
         let mut buf = vec![0u8];
         buf.extend(paddr_change_bytes(addr, 2, 7));
         match parse_notification(&buf[1..]) {
-            Some(Notification::Address(n)) => {
+            Some(Notification::PeerAddrChange(n)) => {
                 assert_eq!(n.addr, addr);
-                assert_eq!(n.state, 2);
+                assert_eq!(n.state, PeerAddrState::Removed);
                 assert_eq!(n.error, 7);
             }
             other => panic!("unexpected {other:?}"),
@@ -847,8 +1027,157 @@ mod tests {
     #[test]
     fn parse_other_type_ignored() {
         let mut bytes = paddr_change_bytes("10.0.1.2:3868".parse().unwrap(), 2, 7);
-        bytes[..2].copy_from_slice(&0x8001u16.to_ne_bytes()); // SCTP_ASSOC_CHANGE
+        bytes[..2].copy_from_slice(&0x8004u16.to_ne_bytes()); // SCTP_REMOTE_ERROR
         assert!(parse_notification(&bytes).is_none());
+    }
+
+    #[test]
+    fn parse_peer_addr_states() {
+        let addr: std::net::SocketAddr = "10.0.1.2:3868".parse().unwrap();
+        for (raw, state) in [
+            (0, PeerAddrState::Available),
+            (1, PeerAddrState::Unreachable),
+            (2, PeerAddrState::Removed),
+            (3, PeerAddrState::Added),
+            (4, PeerAddrState::MadePrimary),
+            (5, PeerAddrState::Confirmed),
+            (6, PeerAddrState::PotentiallyFailed),
+            (99, PeerAddrState::Other(99)),
+        ] {
+            match parse_notification(&paddr_change_bytes(addr, raw, 0)) {
+                Some(Notification::PeerAddrChange(n)) => assert_eq!(n.state, state),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    // An SCTP_ASSOC_CHANGE notification as the kernel delivers it.
+    fn assoc_change_bytes(state: u16, error: u16, info: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&SCTP_ASSOC_CHANGE.to_ne_bytes());
+        b.extend_from_slice(&0u16.to_ne_bytes());
+        b.extend_from_slice(&(20 + info.len() as u32).to_ne_bytes());
+        b.extend_from_slice(&state.to_ne_bytes());
+        b.extend_from_slice(&error.to_ne_bytes());
+        b.extend_from_slice(&5u16.to_ne_bytes()); // outbound streams
+        b.extend_from_slice(&6u16.to_ne_bytes()); // inbound streams
+        b.extend_from_slice(&0i32.to_ne_bytes()); // sac_assoc_id
+        b.extend_from_slice(info);
+        b
+    }
+
+    #[test]
+    fn raw_structs_match_kernel_layout() {
+        assert_eq!(std::mem::size_of::<RawAssocChange>(), 20);
+        assert_eq!(std::mem::size_of::<RawShutdownEvent>(), 12);
+    }
+
+    #[test]
+    fn parse_assoc_change_states() {
+        for (raw, state) in [
+            (0, AssocState::CommUp),
+            (1, AssocState::CommLost),
+            (2, AssocState::Restart),
+            (3, AssocState::ShutdownComplete),
+            (4, AssocState::CantStartAssoc),
+            (99, AssocState::Other(99)),
+        ] {
+            let expected = Notification::AssocChange(AssocChange {
+                state,
+                error: 7,
+                outbound_streams: 5,
+                inbound_streams: 6,
+            });
+            // offset 1 makes every field misaligned; sac_info is ignored
+            let mut buf = vec![0u8];
+            buf.extend(assoc_change_bytes(raw, 7, &[1, 2, 3]));
+            assert_eq!(parse_notification(&buf[1..]), Some(expected));
+        }
+    }
+
+    #[test]
+    fn parse_shutdown_event() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&SCTP_SHUTDOWN_EVENT.to_ne_bytes());
+        bytes.extend_from_slice(&0u16.to_ne_bytes());
+        bytes.extend_from_slice(&12u32.to_ne_bytes());
+        bytes.extend_from_slice(&0i32.to_ne_bytes());
+        // offset 1 makes every field misaligned
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&bytes);
+        assert_eq!(parse_notification(&buf[1..]), Some(Notification::Shutdown));
+        for len in [0, 4, 8, 11] {
+            assert!(parse_notification(&bytes[..len]).is_none(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn parse_assoc_change_short() {
+        let bytes = assoc_change_bytes(0, 0, &[]);
+        for len in [0, 4, 8, 19] {
+            assert!(parse_notification(&bytes[..len]).is_none(), "len {len}");
+        }
+    }
+
+    #[test]
+    fn recv_info_converts() {
+        let raw = SndRcvInfo {
+            sinfo_stream: 2,
+            sinfo_ssn: 3,
+            sinfo_flags: SCTP_UNORDERED,
+            sinfo_ppid: 46u32.to_be(),
+            sinfo_context: 4,
+            sinfo_tsn: 5,
+            sinfo_cumtsn: 6,
+            ..Default::default()
+        };
+        let info = recv_info(10, libc::MSG_EOR, Some(raw)).unwrap();
+        assert_eq!(
+            info,
+            RecvInfo {
+                len: 10,
+                stream: 2,
+                ssn: 3,
+                ppid: 46,
+                unordered: true,
+                eor: true,
+                tsn: 5,
+                cumtsn: 6,
+                context: 4,
+            }
+        );
+        let partial = recv_info(10, 0, Some(SndRcvInfo::default())).unwrap();
+        assert!(!partial.eor && !partial.unordered);
+    }
+
+    #[test]
+    fn recv_info_missing_cmsg() {
+        // EOF and empty buffers have no info to report
+        assert_eq!(recv_info(0, 0, None).unwrap(), RecvInfo::default());
+        // data without info must not look like stream 0, PPID 0
+        let err = recv_info(1, 0, None).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // needs a real socket
+    fn dropped_notifications_counted() {
+        let bytes = assoc_change_bytes(0, 0, &[]);
+        let mut sock = SctpSocket::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        sock.subscribe(Events::all(), tx).unwrap();
+
+        sock.deliver_notification(&bytes);
+        assert_eq!(sock.dropped_notifications(), 0);
+        sock.deliver_notification(&bytes); // the channel is full
+        assert_eq!(sock.dropped_notifications(), 1);
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+
+        // a closed receiver means nobody is interested, so nothing is lost
+        drop(rx);
+        sock.deliver_notification(&bytes);
+        assert_eq!(sock.dropped_notifications(), 1);
     }
 
     fn msghdr_with(cbuf: &mut CmsgBuf) -> libc::msghdr {
@@ -862,7 +1191,7 @@ mod tests {
         let info = SndInfo {
             snd_sid: 3,
             snd_flags: 0,
-            snd_ppid: 46u32.to_be(),
+            snd_ppid: 46, // host order; the cmsg carries network order
             snd_context: 9,
             snd_assoc_id: 0,
         };
@@ -955,7 +1284,7 @@ mod tests {
         let bytes = paddr_change_bytes(addr, 2, 7);
         let mut sock = SctpSocket::new().unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        sock.subscribe_notifications(tx);
+        sock.subscribe(Events::all(), tx).unwrap();
 
         // pieces of one notification, as read with a 64-byte buffer: only the last has MSG_EOR
         sock.handle_notification(&bytes[..64], MSG_NOTIFICATION);
@@ -963,13 +1292,18 @@ mod tests {
         assert!(rx.try_recv().is_err());
         sock.handle_notification(&bytes[128..], MSG_NOTIFICATION | libc::MSG_EOR);
         match rx.try_recv() {
-            Ok(Notification::Address(n)) => assert_eq!((n.addr, n.state, n.error), (addr, 2, 7)),
+            Ok(Notification::PeerAddrChange(n)) => {
+                assert_eq!(
+                    (n.addr, n.state, n.error),
+                    (addr, PeerAddrState::Removed, 7)
+                )
+            }
             other => panic!("unexpected {other:?}"),
         }
 
         // a complete notification is delivered directly
         sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
-        assert!(matches!(rx.try_recv(), Ok(Notification::Address(_))));
+        assert!(matches!(rx.try_recv(), Ok(Notification::PeerAddrChange(_))));
 
         // an oversized notification is dropped, and the next one still works
         let big = vec![0u8; MAX_NOTIFICATION];
@@ -978,6 +1312,6 @@ mod tests {
         sock.handle_notification(&bytes[64..], MSG_NOTIFICATION | libc::MSG_EOR);
         assert!(rx.try_recv().is_err());
         sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
-        assert!(matches!(rx.try_recv(), Ok(Notification::Address(_))));
+        assert!(matches!(rx.try_recv(), Ok(Notification::PeerAddrChange(_))));
     }
 }

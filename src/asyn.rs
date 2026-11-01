@@ -127,12 +127,23 @@ impl SctpSocketTokio {
             }
         }
     }
-    pub fn subscribe_notifications(&mut self, s: tokio::sync::mpsc::Sender<sctp::Notification>) {
-        self.afd.get_mut().subscribe_notifications(s);
+    /// Sends the selected kernel events to `tx`. See [`SctpSocket::subscribe`];
+    /// call it before the socket is shared, and on each accepted socket.
+    pub fn subscribe(
+        &mut self,
+        events: Events,
+        tx: tokio::sync::mpsc::Sender<Notification>,
+    ) -> Result<()> {
+        self.afd.get_mut().subscribe(events, tx)
+    }
+    /// How many notifications were lost because the channel was full.
+    pub fn dropped_notifications(&self) -> u64 {
+        self.afd.get_ref().dropped_notifications()
     }
 
-    /// Sends one message. Errors are returned as is and leave the association
-    /// alone; the kernel reports its state on later calls.
+    /// Sends one message; `info.snd_ppid` is in host order. Errors are returned
+    /// as is and leave the association alone; the kernel reports its state on
+    /// later calls.
     pub async fn sendmsg(&self, data: &[u8], info: &SndInfo) -> Result<usize> {
         loop {
             let mut guard = self.afd.writable().await?;
@@ -149,11 +160,8 @@ impl SctpSocketTokio {
 
     pub async fn sendmsg_def(&self, data: &[u8]) -> Result<usize> {
         let info = SndInfo {
-            snd_sid: 0,
-            snd_flags: 0,
-            snd_ppid: self.afd.get_ref().ppid.to_be(),
-            snd_context: 0,
-            snd_assoc_id: 0,
+            snd_ppid: self.afd.get_ref().ppid,
+            ..Default::default()
         };
         self.sendmsg(data, &info).await
     }
@@ -219,18 +227,17 @@ impl SctpSocketTokio {
             }
         }
     }
-    pub async fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
+    /// Receives user data and reports its stream, PPID and so on. See
+    /// [`SctpSocket::recvmsg_detailed`].
+    pub async fn recvmsg_detailed(&self, data: &mut [u8]) -> Result<RecvInfo> {
         loop {
             let mut guard = self.afd.readable().await?;
-            let res = self.afd.get_ref().recvmsg_detailed_i(data, info);
-            match &res {
+            match self.afd.get_ref().recvmsg_detailed_once(data) {
+                Ok(Some(info)) => return Ok(info),
                 // notification consumed; more data may already be queued, so keep readiness
-                Ok(0x99999999) => continue,
-                Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
-                    guard.clear_ready();
-                    continue;
-                }
-                _ => break res,
+                Ok(None) => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => guard.clear_ready(),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -252,16 +259,6 @@ impl SctpSocketTokio {
             };
         }
     }
-    pub fn subscribe_aux(&self) -> Result<()> {
-        self.afd.get_ref().subscribe_aux()
-    }
-    pub fn subscribe_addr(&self) -> Result<()> {
-        self.afd.get_ref().subscribe_addr()
-    }
-    pub fn subscribe_assoc(&self) -> Result<()> {
-        self.afd.get_ref().subscribe_assoc()
-    }
-
     pub fn listen(&self, backlog: i32) -> Result<()> {
         self.afd.get_ref().listen(backlog)
     }
@@ -333,6 +330,7 @@ impl SctpSocketTokio {
             }
         }
     }
+    /// Sets the PPID that `sendmsg_def` and `AsyncWrite` send, in host order.
     pub fn set_ppid(&mut self, ppid: u32) {
         self.afd.get_mut().set_ppid(ppid)
     }

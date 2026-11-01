@@ -6,10 +6,12 @@ Wrapper does not use lksctp library, but directly libc calls. This simplifies se
 features:
 - bindx - bind multiple IP addresses (for multihoming use)
 - connectx - connect with multiple ip addresses (for multihoming use)
-- set_ppid - configure default protocol identifier to be used in outgoing requests
+- set_ppid - configure default protocol identifier to be used in outgoing requests (host byte order, like every PPID in the API)
 - sendmsg with data and sctp_sndinfo
 - sendmsg with data and default values
 - recvmsg returning data
+- recvmsg_detailed returning data and its stream, PPID and end-of-message flag
+- subscribe - receive association, peer address and peer shutdown events on a channel. Events are processed while something reads from the socket.
 - implements tokio AsyncWrite and AsyncRead
    - this sounds little strange, but it is usefull for protocols defined for both tcp and sctp to have as unified implementation as possible.
    - this is used for example for diameter stack which could then use AsyncWrite/AsyncRead to send/receive from both tcp and sctp
