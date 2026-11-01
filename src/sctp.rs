@@ -1,29 +1,33 @@
 use std::io::{Error, Result};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use os_socketaddr::OsSocketAddr;
 
-#[derive(Debug, Default)]
-struct PendingNotification {
-    buf: Vec<u8>,
-    overflow: bool,
-}
-
-// Largest notification that is reassembled from pieces; bigger ones are dropped.
+// How much of a notification read in pieces is kept. Only fixed-size headers are
+// parsed, so a long tail, e.g. the ABORT chunk in SCTP_ASSOC_CHANGE, can be cut off.
 const MAX_NOTIFICATION: usize = 4096;
+
+// assoc_end value after a graceful end; a failure stores its errno, which is positive
+const ASSOC_END_EOF: i32 = -1;
 
 #[derive(Debug)]
 pub struct SctpSocket {
     fd: RawFd,
     pub(crate) ppid: u32,
     notification_queue: Option<tokio::sync::mpsc::Sender<Notification>>,
+    events: Events,
     // pieces of a notification larger than the read buffer, collected until MSG_EOR
-    notification_pending: std::sync::Mutex<PendingNotification>,
+    notification_pending: std::sync::Mutex<Vec<u8>>,
     // set when the last data read ended without MSG_EOR, i.e. mid-message
     data_partial: AtomicBool,
     // notifications lost because the channel was full
     notifications_dropped: AtomicU64,
+    // How the association ended: 0 while it hasn't, otherwise ASSOC_END_EOF or the
+    // errno. The kernel reports neither for long: after a failure sk_err can be read
+    // only once and poll never shows POLLIN or POLLHUP, and after a local shutdown
+    // recv just returns EAGAIN. So the first result is kept for all later reads.
+    assoc_end: AtomicI32,
 }
 
 const SOL_SCTP: libc::c_int = 132;
@@ -566,7 +570,9 @@ pub struct AssocConfig {
 /// The events to receive, see [`SctpSocket::subscribe`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Events {
-    /// Association state changes, [`Notification::AssocChange`].
+    /// Association state changes, [`Notification::AssocChange`]. The socket always
+    /// gets these from the kernel to notice the end of an association; this selects
+    /// whether they reach the channel.
     pub assoc: bool,
     /// Peer address state changes, [`Notification::PeerAddrChange`].
     pub peer_addr: bool,
@@ -686,9 +692,11 @@ impl SctpSocket {
             fd,
             ppid: 0,
             notification_queue: None,
+            events: Events::default(),
             notification_pending: Default::default(),
             data_partial: AtomicBool::new(false),
             notifications_dropped: AtomicU64::new(0),
+            assoc_end: AtomicI32::new(0),
         }
     }
     fn with_domain(domain: libc::c_int) -> Result<Self> {
@@ -768,11 +776,13 @@ impl SctpSocket {
         };
         self.setsockopt(SOL_SCTP, SCTP_NODELAY, opt)
     }
-    // sctp_data_io_event is always on, so every read can report its SCTP_SNDRCV info
+    // sctp_data_io_event is always on, so every read can report its SCTP_SNDRCV info.
+    // sctp_association_event is too: without a queued event, the end of an association
+    // doesn't wake a reader waiting for POLLIN. Events::assoc only filters the channel.
     fn set_events(&self, events: Events) -> Result<()> {
         let subscribe = SctpEventSubscribe {
             sctp_data_io_event: 1,
-            sctp_association_event: events.assoc as u8,
+            sctp_association_event: 1,
             sctp_address_event: events.peer_addr as u8,
             sctp_shutdown_event: events.shutdown as u8,
             ..Default::default()
@@ -786,9 +796,10 @@ impl SctpSocket {
     /// - An event that doesn't fit in the channel is lost and counted by
     ///   [`SctpSocket::dropped_notifications`].
     /// - Events aren't ordered relative to the data that the reads return.
-    /// - An accepted socket inherits the selected events from the listener, but
-    ///   not the channel. Call `subscribe` on it before its first read; events
-    ///   that are already queued (e.g. `CommUp`) wait in the kernel until then.
+    /// - An accepted socket doesn't inherit the channel. Call `subscribe` on it
+    ///   before its first read. Events that are already queued (e.g. `CommUp`) wait
+    ///   in the kernel until then, so with `assoc` selected `CommUp` still arrives
+    ///   if nothing has read from the socket yet, also after connect or accept.
     /// - A failed connect is reported by its `Err`, not by an event, because
     ///   the socket is closed before anything can read the event.
     /// - `ShutdownComplete` can arrive after a read returned 0, so a reader
@@ -799,6 +810,7 @@ impl SctpSocket {
         tx: tokio::sync::mpsc::Sender<Notification>,
     ) -> Result<()> {
         self.set_events(events)?;
+        self.events = events;
         self.notification_queue = Some(tx);
         Ok(())
     }
@@ -1081,7 +1093,10 @@ impl SctpSocket {
         // no MSG_DONTWAIT: blocking sockets block, and SctpSocketTokio sets O_NONBLOCK
         let r = unsafe { libc::sendmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
         if r < 0 {
-            Err(Error::last_os_error())
+            let err = Error::last_os_error();
+            // this took the error from the kernel, so reads can't get it from there
+            self.record_if_fatal(&err);
+            Err(err)
         } else {
             Ok(r as usize)
         }
@@ -1089,6 +1104,10 @@ impl SctpSocket {
 
     /// Receives user data. Notifications are consumed (and forwarded to the
     /// notification queue, if one is set) instead of being returned as data.
+    ///
+    /// Once the association has ended and the data before that has been read, this
+    /// keeps returning how it ended: the error that made it fail, or `Ok(0)` after a
+    /// graceful shutdown. It doesn't wait, also on a blocking socket.
     ///
     /// An empty `data` returns `Ok(0)` without reading, which isn't EOF there.
     pub fn recvmsg(&self, data: &mut [u8]) -> Result<usize> {
@@ -1147,9 +1166,30 @@ impl SctpSocket {
         msghdr.msg_iovlen = 1;
         cbuf.attach(&mut msghdr);
 
-        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, 0) };
+        // what's left is already queued, so a blocking socket must not sleep for more
+        let flags = if self.assoc_end.load(Ordering::Relaxed) != 0 {
+            libc::MSG_DONTWAIT
+        } else {
+            0
+        };
+        let r = unsafe { libc::recvmsg(self.fd, &mut msghdr as *mut libc::msghdr, flags) };
         if r < 0 {
-            return Err(Error::last_os_error());
+            let err = Error::last_os_error();
+            self.record_if_fatal(&err);
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                match self.assoc_end.load(Ordering::Relaxed) {
+                    0 => {}
+                    ASSOC_END_EOF => {
+                        return Ok(Some(Received {
+                            len: 0,
+                            msg_flags: 0,
+                            info: None,
+                        }))
+                    }
+                    errno => return Err(Error::from_raw_os_error(errno)),
+                }
+            }
+            return Err(err);
         }
         let len = r as usize;
         if msghdr.msg_flags & MSG_NOTIFICATION != 0 {
@@ -1219,6 +1259,19 @@ impl SctpSocket {
         self.data_partial.load(Ordering::Relaxed)
     }
 
+    // The first result stays, so all callers see the same one.
+    fn record_end(&self, value: i32) {
+        let _ = self
+            .assoc_end
+            .compare_exchange(0, value, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    fn record_if_fatal(&self, err: &Error) {
+        if let Some(errno) = err.raw_os_error().filter(|e| is_fatal_errno(*e)) {
+            self.record_end(errno);
+        }
+    }
+
     fn handle_notification(&self, data: &[u8], msg_flags: libc::c_int) {
         // A notification larger than the read buffer arrives in pieces and only the
         // last one has MSG_EOR, so the pieces are collected until then.
@@ -1227,37 +1280,60 @@ impl SctpSocket {
             .notification_pending
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if complete && pending.buf.is_empty() && !pending.overflow {
+        if complete && pending.is_empty() {
             drop(pending);
             self.deliver_notification(data);
             return;
         }
-        if pending.buf.len() + data.len() <= MAX_NOTIFICATION {
-            pending.buf.extend_from_slice(data);
-        } else {
-            // e.g. SCTP_SEND_FAILED carrying a large message; none we parse
-            pending.overflow = true;
-        }
+        let room = MAX_NOTIFICATION.saturating_sub(pending.len());
+        pending.extend_from_slice(&data[..data.len().min(room)]);
         if complete {
-            let p = std::mem::take(&mut *pending);
+            let notification = std::mem::take(&mut *pending);
             drop(pending);
-            if !p.overflow {
-                self.deliver_notification(&p.buf);
-            }
+            self.deliver_notification(&notification);
         }
     }
 
     fn deliver_notification(&self, data: &[u8]) {
-        let Some(q) = &self.notification_queue else {
+        let Some(not) = parse_notification(data) else {
             return;
         };
-        let Some(not) = parse_notification(data) else {
+        if let Notification::AssocChange(change) = &not {
+            match change.state {
+                AssocState::CommLost => self.record_comm_lost(),
+                AssocState::ShutdownComplete => self.record_end(ASSOC_END_EOF),
+                _ => {}
+            }
+            if !self.events.assoc {
+                return;
+            }
+        }
+        let Some(q) = &self.notification_queue else {
             return;
         };
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = q.try_send(not) {
             self.notifications_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    fn record_comm_lost(&self) {
+        // Nothing else will report it to a later read. No error here means something
+        // else took it: a send, which has recorded it, or SO_ERROR through the fd.
+        let errno = match self.take_error() {
+            Ok(Some(e)) => e.raw_os_error().unwrap_or(libc::ECONNABORTED),
+            _ => libc::ECONNABORTED,
+        };
+        self.record_end(errno);
+    }
+}
+
+/// Errors that mean the association is gone. EPIPE isn't one of them: it's also what
+/// a send gets after a local shutdown. ECONNREFUSED only ends a connect attempt.
+fn is_fatal_errno(errno: i32) -> bool {
+    matches!(
+        errno,
+        libc::ECONNRESET | libc::ETIMEDOUT | libc::ECONNABORTED
+    )
 }
 
 // Control buffer for one SCTP cmsg. A plain byte (or i32) array doesn't have the
@@ -1562,6 +1638,41 @@ mod tests {
             let err = assoc_params_raw(params).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn fatal_errnos() {
+        for errno in [libc::ECONNRESET, libc::ETIMEDOUT, libc::ECONNABORTED] {
+            assert!(is_fatal_errno(errno), "{errno}");
+        }
+        for errno in [libc::EPIPE, libc::EAGAIN, libc::EINVAL, libc::ECONNREFUSED] {
+            assert!(!is_fatal_errno(errno), "{errno}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // needs a real socket
+    fn first_recorded_end_stays() {
+        let sock = SctpSocket::new().unwrap();
+        sock.record_end(libc::ETIMEDOUT);
+        sock.record_end(libc::ECONNRESET);
+        sock.record_end(ASSOC_END_EOF);
+        assert_eq!(sock.assoc_end.load(Ordering::Relaxed), libc::ETIMEDOUT);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // needs a real socket
+    fn assoc_events_filtered_but_tracked() {
+        let mut sock = SctpSocket::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let events = Events {
+            shutdown: true,
+            ..Default::default()
+        };
+        sock.subscribe(events, tx).unwrap();
+        sock.deliver_notification(&assoc_change_bytes(3, 0, &[])); // SHUTDOWN_COMP
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sock.assoc_end.load(Ordering::Relaxed), ASSOC_END_EOF);
     }
 
     #[test]
@@ -1901,12 +2012,20 @@ mod tests {
         sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
         assert!(matches!(rx.try_recv(), Ok(Notification::PeerAddrChange(_))));
 
-        // an oversized notification is dropped, and the next one still works
-        let big = vec![0u8; MAX_NOTIFICATION];
-        sock.handle_notification(&bytes[..64], MSG_NOTIFICATION);
-        sock.handle_notification(&big, MSG_NOTIFICATION);
-        sock.handle_notification(&bytes[64..], MSG_NOTIFICATION | libc::MSG_EOR);
-        assert!(rx.try_recv().is_err());
+        // only the start of an oversized notification is kept, which is the part parsed
+        let lost = assoc_change_bytes(1, 0, &[0x55; 8000]);
+        for (i, piece) in lost.chunks(64).enumerate() {
+            let last = (i + 1) * 64 >= lost.len();
+            let flags = MSG_NOTIFICATION | if last { libc::MSG_EOR } else { 0 };
+            sock.handle_notification(piece, flags);
+        }
+        match rx.try_recv() {
+            Ok(Notification::AssocChange(c)) => assert_eq!(c.state, AssocState::CommLost),
+            other => panic!("unexpected {other:?}"),
+        }
+        // no error was pending on this socket, so the fallback was recorded
+        assert_eq!(sock.assoc_end.load(Ordering::Relaxed), libc::ECONNABORTED);
+        // and the next notification still works
         sock.handle_notification(&bytes, MSG_NOTIFICATION | libc::MSG_EOR);
         assert!(matches!(rx.try_recv(), Ok(Notification::PeerAddrChange(_))));
     }
