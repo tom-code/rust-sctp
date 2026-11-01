@@ -470,12 +470,19 @@ impl SctpSocket {
 
     /// Receives user data. Notifications are consumed (and forwarded to the
     /// notification queue, if one is set) instead of being returned as data.
+    ///
+    /// An empty `data` returns `Ok(0)` without reading, which isn't EOF there.
     pub fn recvmsg(&self, data: &mut [u8]) -> Result<usize> {
         self.recvmsg_eor(data).map(|(n, _)| n)
     }
 
     /// Like `recvmsg`, but also returns whether the data ends a message (MSG_EOR).
     pub(crate) fn recvmsg_eor(&self, data: &mut [u8]) -> Result<(usize, bool)> {
+        // a queued notification can't be consumed into an empty buffer, so the
+        // loop below would never make progress
+        if data.is_empty() {
+            return Ok((0, false));
+        }
         loop {
             let mut iovec_item = libc::iovec {
                 iov_base: data.as_ptr() as *mut libc::c_void,
@@ -501,6 +508,8 @@ impl SctpSocket {
         }
     }
 
+    /// Receives user data and its SCTP_SNDRCV info. An empty `data` returns
+    /// `Ok(0)` without reading, which isn't EOF there.
     pub fn recvmsg_detailed(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
         loop {
             let r = self.recvmsg_detailed_i(data, info);
@@ -513,6 +522,12 @@ impl SctpSocket {
                 Err(_) => return r,
             }
         }
+    }
+    /// Reads and clears the pending socket error (SO_ERROR).
+    pub(crate) fn take_error(&self) -> Result<Option<Error>> {
+        let mut err: libc::c_int = 0;
+        self.getsockopt(libc::SOL_SOCKET, libc::SO_ERROR, &mut err)?;
+        Ok((err != 0).then(|| Error::from_raw_os_error(err)))
     }
     pub fn getsocketname(&self) -> Result<std::net::SocketAddr> {
         let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -602,6 +617,10 @@ impl SctpSocket {
     }
 
     pub fn recvmsg_detailed_i(&self, data: &mut [u8], info: &mut SndRcvInfo) -> Result<usize> {
+        // see recvmsg_eor: callers would retry a notification forever
+        if data.is_empty() {
+            return Ok(0);
+        }
         let mut iovec_item = libc::iovec {
             iov_base: data.as_ptr() as *mut libc::c_void,
             iov_len: data.len(),

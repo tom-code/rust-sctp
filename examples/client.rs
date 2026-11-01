@@ -48,7 +48,7 @@ async fn main() {
                 println!("{:?}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             }
-            Ok(_) => break socket,
+            Ok(connected) => break connected,
         }
     });
     let connected2 = connected.clone();

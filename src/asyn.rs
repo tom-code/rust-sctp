@@ -1,13 +1,12 @@
 use std::io::Result;
 use std::{
     io::{Error, Read, Write},
-    os::fd::AsRawFd,
     pin::Pin,
     task::{Context, Poll},
 };
 
 use crate::*;
-use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf};
 
 #[derive(Debug)]
 pub struct SctpSocketTokio {
@@ -80,63 +79,52 @@ impl SctpSocketTokio {
         self.afd.get_ref().bindx(addresses)
     }
 
-    pub async fn connect(&self, address: std::net::SocketAddr) -> Result<()> {
+    /// Connects to `address` and returns the connected socket.
+    ///
+    /// The socket is consumed: if the connect fails or the future is dropped, the
+    /// socket is closed, and a retry needs a new one. tokio can't reset the
+    /// write-closed readiness a failed connect leaves on a socket.
+    pub async fn connect(self, address: std::net::SocketAddr) -> Result<Self> {
         if let Err(e) = self.afd.get_ref().connect(address) {
-            if !e.raw_os_error().is_some_and(|e| e == libc::EINPROGRESS) {
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
                 return Err(e);
             }
         }
-        let _guard = self.afd.writable().await?;
-
-        let (so_error, getsockopt_result) = unsafe {
-            let mut err: libc::c_int = 0;
-            let mut len: libc::socklen_t = 4;
-            let res = libc::getsockopt(
-                self.afd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut err as *mut libc::c_int as *mut libc::c_void,
-                &mut len,
-            );
-            (err, res)
-        };
-        if getsockopt_result != 0 {
-            return Err(Error::last_os_error());
-        }
-        if so_error != 0 {
-            Err(Error::from_raw_os_error(so_error))
-        } else {
-            Ok(())
-        }
+        self.wait_connected().await?;
+        Ok(self)
     }
 
-    pub async fn connectx(&self, addresses: &[std::net::SocketAddr]) -> Result<()> {
+    /// Connects to a peer with several addresses and returns the connected socket.
+    /// The socket is consumed, see [`SctpSocketTokio::connect`].
+    pub async fn connectx(self, addresses: &[std::net::SocketAddr]) -> Result<Self> {
         if let Err(e) = self.afd.get_ref().connectx(addresses) {
-            if !e.raw_os_error().is_some_and(|e| e == libc::EINPROGRESS) {
+            if e.raw_os_error() != Some(libc::EINPROGRESS) {
                 return Err(e);
             }
         }
-        let _guard = self.afd.writable().await?;
+        self.wait_connected().await?;
+        Ok(self)
+    }
 
-        let (so_error, getsockopt_result) = unsafe {
-            let mut err: libc::c_int = 0;
-            let mut len: libc::socklen_t = 4;
-            let res = libc::getsockopt(
-                self.afd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_ERROR,
-                &mut err as *mut libc::c_int as *mut libc::c_void,
-                &mut len,
-            );
-            (err, res)
-        };
-        if getsockopt_result != 0 {
-            return Err(Error::last_os_error());
-        }
-        if so_error != 0 {
-            Err(Error::from_raw_os_error(so_error))
-        } else {
-            Ok(())
+    async fn wait_connected(&self) -> Result<()> {
+        loop {
+            // A failed connect can report EPOLLERR|EPOLLIN when an event is queued
+            // (e.g. SCTP_ASSOC_CHANGE), which writable() alone would never see.
+            let mut guard = self.afd.ready(Interest::WRITABLE | Interest::ERROR).await?;
+            if let Some(e) = self.afd.get_ref().take_error()? {
+                return Err(e);
+            }
+            match self.afd.get_ref().getpeername() {
+                Ok(_) => return Ok(()),
+                Err(e) if e.raw_os_error() == Some(libc::ENOTCONN) => {
+                    // closed readiness can't be cleared, so waiting again would spin
+                    if guard.ready().is_write_closed() {
+                        return Err(e);
+                    }
+                    guard.clear_ready();
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     pub fn subscribe_notifications(&mut self, s: tokio::sync::mpsc::Sender<sctp::Notification>) {
