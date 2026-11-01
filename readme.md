@@ -12,6 +12,10 @@ features:
 - recvmsg returning data
 - recvmsg_detailed returning data and its stream, PPID and end-of-message flag
 - subscribe - receive association, peer address and peer shutdown events on a channel. Events are processed while something reads from the socket.
+- peer_addrs, local_addrs - the addresses of a multihomed association
+- status - association state, negotiated stream counts and primary path
+- set_path_params, set_assoc_params - heartbeats and retransmit limits per socket, association or path
+- set_reuse_addr, set_abort_on_close, set_sndbuf, and set_linger on the blocking socket. The file descriptor is available through AsRawFd and AsFd.
 - implements tokio AsyncWrite and AsyncRead
    - this sounds little strange, but it is usefull for protocols defined for both tcp and sctp to have as unified implementation as possible.
    - this is used for example for diameter stack which could then use AsyncWrite/AsyncRead to send/receive from both tcp and sctp

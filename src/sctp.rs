@@ -1,5 +1,5 @@
 use std::io::{Error, Result};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use os_socketaddr::OsSocketAddr;
@@ -35,6 +35,23 @@ const SCTP_EVENTS: libc::c_int = 11;
 const SCTP_RTOINFO: i32 = 0;
 const SCTP_INIT_MSG: i32 = 2;
 const SCTP_PRIMARY_ADDR: libc::c_int = 6;
+const SCTP_ASSOCINFO: libc::c_int = 1;
+const SCTP_PEER_ADDR_PARAMS: libc::c_int = 9;
+const SCTP_STATUS: libc::c_int = 14;
+const SCTP_GET_PEER_ADDRS: libc::c_int = 108;
+const SCTP_GET_LOCAL_ADDRS: libc::c_int = 109;
+
+// spp_flags
+const SPP_HB_ENABLE: u32 = 1 << 0;
+const SPP_HB_DISABLE: u32 = 1 << 1;
+const SPP_HB_TIME_IS_ZERO: u32 = 1 << 7;
+
+// struct sctp_getaddrs before the variable-length addresses
+const GETADDRS_HEADER: usize = 8;
+// Limits for the address list buffer. The kernel kmallocs the local list's
+// buffer, so it starts small and only grows when the kernel asks for more.
+const ADDR_LIST_MIN: usize = 4096;
+const ADDR_LIST_MAX: usize = 1024 * 1024;
 
 // aux info
 //const SCTP_INIT: i32 = 0;
@@ -234,18 +251,316 @@ struct Prim {
     ssp_addr: [u8; 128],
 }
 
+// struct sctp_paddrinfo: packed, aligned(4), so the address is kept as bytes
 #[repr(C)]
-#[derive(Debug)]
-pub struct Status {
-    pub sstat_assoc_id: u32,
-    pub sstat_state: i32,
-    pub sstat_rwnd: u32,
-    pub sstat_unackdata: u16,
-    pub sstat_penddata: u16,
-    pub sstat_instrms: u16,
-    pub sstat_outstrms: u16,
-    pub sstat_fragmentation_point: u32,
-    //pub sstat_primary: Struct_sctp_paddrinfo,
+#[derive(Debug, Clone, Copy)]
+struct RawPaddrInfo {
+    spinfo_assoc_id: i32,
+    spinfo_address: [u8; 128],
+    spinfo_state: i32,
+    spinfo_cwnd: u32,
+    spinfo_srtt: u32,
+    spinfo_rto: u32,
+    spinfo_mtu: u32,
+}
+
+// struct sctp_status
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RawStatus {
+    sstat_assoc_id: i32,
+    sstat_state: i32,
+    sstat_rwnd: u32,
+    sstat_unackdata: u16,
+    sstat_penddata: u16,
+    sstat_instrms: u16,
+    sstat_outstrms: u16,
+    sstat_fragmentation_point: u32,
+    sstat_primary: RawPaddrInfo,
+}
+
+// struct sctp_assocparams
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawAssocParams {
+    sasoc_assoc_id: i32,
+    sasoc_asocmaxrxt: u16,
+    sasoc_number_peer_destinations: u16,
+    sasoc_peer_rwnd: u32,
+    sasoc_local_rwnd: u32,
+    sasoc_cookie_life: u32,
+}
+
+// struct sctp_paddrparams is packed, aligned(4): spp_pathmtu is at offset 138, and
+// the trailing padding makes it 156 bytes. Rust can't put packed and align on one
+// struct, so the wrapper adds the alignment. Fields can only be read by value.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct PaddrParamsFields {
+    spp_assoc_id: i32,
+    spp_address: [u8; 128],
+    spp_hbinterval: u32,
+    spp_pathmaxrxt: u16,
+    spp_pathmtu: u32,
+    spp_sackdelay: u32,
+    spp_flags: u32,
+    spp_ipv6_flowlabel: u32,
+    spp_dscp: u8,
+}
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct RawPaddrParams(PaddrParamsFields);
+
+impl RawPaddrParams {
+    // A zero address selects the association (or the socket when there is none).
+    fn new(addr: Option<std::net::SocketAddr>) -> Self {
+        RawPaddrParams(PaddrParamsFields {
+            spp_assoc_id: 0,
+            spp_address: addr.map_or([0; 128], addr_to_storage),
+            spp_hbinterval: 0,
+            spp_pathmaxrxt: 0,
+            spp_pathmtu: 0,
+            spp_sackdelay: 0,
+            spp_flags: 0,
+            spp_ipv6_flowlabel: 0,
+            spp_dscp: 0,
+        })
+    }
+}
+
+fn addr_to_storage(addr: std::net::SocketAddr) -> [u8; 128] {
+    let osa: OsSocketAddr = addr.into();
+    let raw = osa.as_ref();
+    let mut storage = [0; 128];
+    storage[..raw.len()].copy_from_slice(raw);
+    storage
+}
+
+fn storage_to_addr(storage: &[u8; 128]) -> Result<std::net::SocketAddr> {
+    let osa = unsafe { OsSocketAddr::copy_from_raw(storage.as_ptr().cast(), storage.len() as _) };
+    osa.into_addr()
+        .ok_or_else(|| Error::new(std::io::ErrorKind::InvalidData, "Invalid socket address"))
+}
+
+/// Parses the `count` addresses of a struct sctp_getaddrs. Entries have the length
+/// of their address family, so the list can only be walked from the start.
+fn parse_addr_list(mut data: &[u8], count: usize) -> Result<Vec<std::net::SocketAddr>> {
+    let bad = || Error::new(std::io::ErrorKind::InvalidData, "Invalid address list");
+    let mut addrs = Vec::new();
+    for _ in 0..count {
+        let family = data.get(..2).ok_or_else(bad)?;
+        let len = match u16::from_ne_bytes([family[0], family[1]]) as libc::c_int {
+            libc::AF_INET => std::mem::size_of::<libc::sockaddr_in>(),
+            libc::AF_INET6 => std::mem::size_of::<libc::sockaddr_in6>(),
+            _ => return Err(bad()),
+        };
+        let entry = data.get(..len).ok_or_else(bad)?;
+        let osa = unsafe { OsSocketAddr::copy_from_raw(entry.as_ptr().cast(), len as _) };
+        addrs.push(osa.into_addr().ok_or_else(bad)?);
+        data = &data[len..];
+    }
+    Ok(addrs)
+}
+
+fn invalid_zero(what: &str) -> Error {
+    Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("{what} can't be 0: the kernel would keep the current value"),
+    )
+}
+
+fn path_params_raw(
+    addr: Option<std::net::SocketAddr>,
+    params: PathParams,
+) -> Result<RawPaddrParams> {
+    let mut raw = RawPaddrParams::new(addr);
+    match params.heartbeat {
+        None => {}
+        Some(Heartbeat::Disabled) => raw.0.spp_flags = SPP_HB_DISABLE,
+        Some(Heartbeat::Enabled) => raw.0.spp_flags = SPP_HB_ENABLE,
+        Some(Heartbeat::Interval(0)) => raw.0.spp_flags = SPP_HB_ENABLE | SPP_HB_TIME_IS_ZERO,
+        Some(Heartbeat::Interval(ms)) => {
+            raw.0.spp_flags = SPP_HB_ENABLE;
+            raw.0.spp_hbinterval = ms;
+        }
+    }
+    if let Some(n) = params.max_retrans {
+        if n == 0 {
+            return Err(invalid_zero("max_retrans"));
+        }
+        raw.0.spp_pathmaxrxt = n;
+    }
+    Ok(raw)
+}
+
+fn assoc_params_raw(params: AssocParams) -> Result<RawAssocParams> {
+    let mut raw = RawAssocParams::default();
+    if let Some(n) = params.max_retrans {
+        if n == 0 {
+            return Err(invalid_zero("max_retrans"));
+        }
+        raw.sasoc_asocmaxrxt = n;
+    }
+    if let Some(ms) = params.cookie_life_ms {
+        if ms == 0 {
+            return Err(invalid_zero("cookie_life_ms"));
+        }
+        raw.sasoc_cookie_life = ms;
+    }
+    Ok(raw)
+}
+
+fn linger_value(linger: Option<std::time::Duration>) -> libc::linger {
+    match linger {
+        None => libc::linger {
+            l_onoff: 0,
+            l_linger: 0,
+        },
+        Some(d) => {
+            // SO_LINGER has whole seconds; rounding down could turn a short linger
+            // into 0, which aborts instead of waiting
+            let secs = d.as_secs().saturating_add(u64::from(d.subsec_nanos() > 0));
+            libc::linger {
+                l_onoff: 1,
+                l_linger: secs.min(libc::c_int::MAX as u64) as libc::c_int,
+            }
+        }
+    }
+}
+
+/// What [`SctpSocket::status`] reports about the association (SCTP_STATUS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssocStatus {
+    pub state: AssocStatusState,
+    /// The peer's current receive window.
+    pub peer_rwnd: u32,
+    /// Data chunks sent and not yet acknowledged.
+    pub unacked_data: u16,
+    /// Data chunks waiting to be read.
+    pub pending_data: u16,
+    /// Negotiated stream counts. A stream id must be below `outbound_streams`
+    /// to be sent on.
+    pub inbound_streams: u16,
+    pub outbound_streams: u16,
+    pub fragmentation_point: u32,
+    /// The primary path.
+    pub primary: PathInfo,
+}
+
+/// The state of one path, see [`AssocStatus::primary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathInfo {
+    pub addr: std::net::SocketAddr,
+    pub state: PathState,
+    pub cwnd: u32,
+    pub rto_ms: u32,
+    pub mtu: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssocStatusState {
+    Empty,
+    Closed,
+    CookieWait,
+    CookieEchoed,
+    Established,
+    ShutdownPending,
+    ShutdownSent,
+    ShutdownReceived,
+    ShutdownAckSent,
+    /// A state this crate doesn't know.
+    Other(i32),
+}
+
+impl AssocStatusState {
+    fn from_raw(state: i32) -> Self {
+        match state {
+            0 => AssocStatusState::Empty,
+            1 => AssocStatusState::Closed,
+            2 => AssocStatusState::CookieWait,
+            3 => AssocStatusState::CookieEchoed,
+            4 => AssocStatusState::Established,
+            5 => AssocStatusState::ShutdownPending,
+            6 => AssocStatusState::ShutdownSent,
+            7 => AssocStatusState::ShutdownReceived,
+            8 => AssocStatusState::ShutdownAckSent,
+            other => AssocStatusState::Other(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathState {
+    Inactive,
+    PotentiallyFailed,
+    Active,
+    Unconfirmed,
+    /// A state this crate doesn't know.
+    Other(i32),
+}
+
+impl PathState {
+    fn from_raw(state: i32) -> Self {
+        match state {
+            0 => PathState::Inactive,
+            1 => PathState::PotentiallyFailed,
+            2 => PathState::Active,
+            3 => PathState::Unconfirmed,
+            other => PathState::Other(other),
+        }
+    }
+}
+
+/// How a path sends heartbeats, see [`PathParams`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heartbeat {
+    Disabled,
+    /// Enabled, with the interval unchanged.
+    Enabled,
+    /// Enabled, with this interval in milliseconds. The kernel adds the path's
+    /// RTO to it. Values are rounded up to a kernel timer tick.
+    Interval(u32),
+}
+
+/// Path settings to change (SCTP_PEER_ADDR_PARAMS). `None` leaves a setting
+/// unchanged. See [`SctpSocket::set_path_params`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathParams {
+    pub heartbeat: Option<Heartbeat>,
+    /// Retransmissions before a path is unreachable. Can't be 0.
+    pub max_retrans: Option<u16>,
+}
+
+/// Current path settings, see [`SctpSocket::path_params`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathConfig {
+    pub heartbeat_enabled: bool,
+    pub heartbeat_interval_ms: u32,
+    pub max_retrans: u16,
+    /// Path MTU, or 0 when there is no association yet.
+    pub mtu: u32,
+}
+
+/// Association settings to change (SCTP_ASSOCINFO). `None` leaves a setting
+/// unchanged. See [`SctpSocket::set_assoc_params`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AssocParams {
+    /// Retransmissions before the association fails. Can't be 0. With several
+    /// paths the kernel rejects a value above the sum of their path limits.
+    pub max_retrans: Option<u16>,
+    /// Can't be 0.
+    pub cookie_life_ms: Option<u32>,
+}
+
+/// Current association settings, see [`SctpSocket::assoc_params`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssocConfig {
+    pub max_retrans: u16,
+    pub peer_destinations: u16,
+    pub peer_rwnd: u32,
+    pub local_rwnd: u32,
+    pub cookie_life_ms: u32,
 }
 
 /// The events to receive, see [`SctpSocket::subscribe`].
@@ -419,6 +734,17 @@ impl SctpSocket {
             )
         })
     }
+    fn getsockopt_slice(
+        &self,
+        level: libc::c_int,
+        option: libc::c_int,
+        value: &mut [u8],
+    ) -> Result<()> {
+        let mut n = value.len() as libc::socklen_t;
+        handle_libc_error(unsafe {
+            libc::getsockopt(self.fd, level, option, value.as_mut_ptr().cast(), &mut n)
+        })
+    }
     fn setsockopt_slice(
         &self,
         level: libc::c_int,
@@ -480,7 +806,7 @@ impl SctpSocket {
     pub fn dropped_notifications(&self) -> u64 {
         self.notifications_dropped.load(Ordering::Relaxed)
     }
-    pub fn set_snfbuf(&self, size: i32) -> Result<()> {
+    pub fn set_sndbuf(&self, size: i32) -> Result<()> {
         self.setsockopt(libc::SOL_SOCKET, libc::SO_SNDBUF, size)
     }
     pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
@@ -510,13 +836,10 @@ impl SctpSocket {
     /// If the primary fails the kernel sends over another path, and returns to the
     /// primary once it is reachable again (SCTP_ADDR_AVAILABLE).
     pub fn set_primary_addr(&self, addr: std::net::SocketAddr) -> Result<()> {
-        let osa: OsSocketAddr = addr.into();
-        let raw = osa.as_ref();
-        let mut prim = Prim {
+        let prim = Prim {
             ssp_assoc_id: 0,
-            ssp_addr: [0; 128],
+            ssp_addr: addr_to_storage(addr),
         };
-        prim.ssp_addr[..raw.len()].copy_from_slice(raw);
         self.setsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, prim)
     }
     /// The current primary peer address. It stays the same while the kernel
@@ -527,11 +850,140 @@ impl SctpSocket {
             ssp_addr: [0; 128],
         };
         self.getsockopt(SOL_SCTP, SCTP_PRIMARY_ADDR, &mut prim)?;
-        let osa = unsafe {
-            OsSocketAddr::copy_from_raw(prim.ssp_addr.as_ptr().cast(), prim.ssp_addr.len() as _)
-        };
-        osa.into_addr()
-            .ok_or_else(|| Error::new(std::io::ErrorKind::InvalidData, "Invalid socket address"))
+        storage_to_addr(&prim.ssp_addr)
+    }
+    fn read_addrs(&self, option: libc::c_int, assoc_id: i32) -> Result<Vec<std::net::SocketAddr>> {
+        let mut size = ADDR_LIST_MIN;
+        loop {
+            let mut buf = vec![0u8; size];
+            buf[..4].copy_from_slice(&assoc_id.to_ne_bytes());
+            match self.getsockopt_slice(SOL_SCTP, option, &mut buf) {
+                Ok(()) => {
+                    // not optlen: for the local list it leaves out the header
+                    let count = u32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    return parse_addr_list(&buf[GETADDRS_HEADER..], count as usize);
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOMEM) && size < ADDR_LIST_MAX => {
+                    size *= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    /// The addresses of the peer. Fails with `EINVAL` without an association. On
+    /// an IPv6 socket an IPv4 peer may be reported in its v4-mapped form.
+    pub fn peer_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        self.read_addrs(SCTP_GET_PEER_ADDRS, 0)
+    }
+    /// The local addresses. With an association these are the ones it uses,
+    /// which are what the peer knows about. Otherwise these are the bound
+    /// addresses: for a wildcard bind all addresses of the machine, and none for
+    /// an unbound socket. An IPv4 address on an IPv6 socket may be reported in
+    /// its v4-mapped form.
+    pub fn local_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        // only this option doesn't ignore the id: 0 means the bound addresses
+        let id = self.raw_status().map_or(0, |s| s.sstat_assoc_id);
+        match self.read_addrs(SCTP_GET_LOCAL_ADDRS, id) {
+            // the association ended since the status was read
+            Err(e) if id != 0 && e.raw_os_error() == Some(libc::EINVAL) => {
+                self.read_addrs(SCTP_GET_LOCAL_ADDRS, 0)
+            }
+            res => res,
+        }
+    }
+    fn raw_status(&self) -> Result<RawStatus> {
+        // Safety: the struct only holds integers and integer arrays
+        let mut raw: RawStatus = unsafe { std::mem::zeroed() };
+        self.getsockopt(SOL_SCTP, SCTP_STATUS, &mut raw)?;
+        Ok(raw)
+    }
+    /// The state of the association, including the negotiated stream counts.
+    /// Fails with `EINVAL` without an association.
+    pub fn status(&self) -> Result<AssocStatus> {
+        let raw = self.raw_status()?;
+        let primary = raw.sstat_primary;
+        Ok(AssocStatus {
+            state: AssocStatusState::from_raw(raw.sstat_state),
+            peer_rwnd: raw.sstat_rwnd,
+            unacked_data: raw.sstat_unackdata,
+            pending_data: raw.sstat_penddata,
+            inbound_streams: raw.sstat_instrms,
+            outbound_streams: raw.sstat_outstrms,
+            fragmentation_point: raw.sstat_fragmentation_point,
+            // spinfo_srtt is left out: unlike spinfo_rto the kernel doesn't convert
+            // it to milliseconds
+            primary: PathInfo {
+                addr: storage_to_addr(&primary.spinfo_address)?,
+                state: PathState::from_raw(primary.spinfo_state),
+                cwnd: primary.spinfo_cwnd,
+                rto_ms: primary.spinfo_rto,
+                mtu: primary.spinfo_mtu,
+            },
+        })
+    }
+    /// Changes path settings. `Some(addr)` selects one peer address (`EINVAL` if
+    /// it isn't one; on an IPv6 socket an IPv4 peer may need its v4-mapped form).
+    /// `None` selects all paths of the association, or without an association
+    /// the defaults for future ones, which accepted sockets get from a listener.
+    pub fn set_path_params(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+        params: PathParams,
+    ) -> Result<()> {
+        self.setsockopt(
+            SOL_SCTP,
+            SCTP_PEER_ADDR_PARAMS,
+            path_params_raw(addr, params)?,
+        )
+    }
+    /// The current path settings, with the same `addr` rules as
+    /// [`SctpSocket::set_path_params`].
+    pub fn path_params(&self, addr: Option<std::net::SocketAddr>) -> Result<PathConfig> {
+        let mut raw = RawPaddrParams::new(addr);
+        self.getsockopt(SOL_SCTP, SCTP_PEER_ADDR_PARAMS, &mut raw)?;
+        let fields = raw.0;
+        Ok(PathConfig {
+            heartbeat_enabled: fields.spp_flags & SPP_HB_ENABLE != 0,
+            heartbeat_interval_ms: fields.spp_hbinterval,
+            max_retrans: fields.spp_pathmaxrxt,
+            mtu: fields.spp_pathmtu,
+        })
+    }
+    /// Changes association settings: those of the association, or without one the
+    /// defaults for future ones, which accepted sockets get from a listener.
+    pub fn set_assoc_params(&self, params: AssocParams) -> Result<()> {
+        self.setsockopt(SOL_SCTP, SCTP_ASSOCINFO, assoc_params_raw(params)?)
+    }
+    /// The current association settings, or without an association the defaults.
+    pub fn assoc_params(&self) -> Result<AssocConfig> {
+        let mut raw = RawAssocParams::default();
+        self.getsockopt(SOL_SCTP, SCTP_ASSOCINFO, &mut raw)?;
+        Ok(AssocConfig {
+            max_retrans: raw.sasoc_asocmaxrxt,
+            peer_destinations: raw.sasoc_number_peer_destinations,
+            peer_rwnd: raw.sasoc_peer_rwnd,
+            local_rwnd: raw.sasoc_local_rwnd,
+            cookie_life_ms: raw.sasoc_cookie_life,
+        })
+    }
+    /// Sets SO_REUSEADDR. Call it before `bind`. A port can only be shared if both
+    /// sockets set this and the other one isn't listening, e.g. to restart a
+    /// listener while its accepted sockets stay up. They inherit the option.
+    pub fn set_reuse_addr(&self, enable: bool) -> Result<()> {
+        let opt = enable as libc::c_int;
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_REUSEADDR, opt)
+    }
+    /// Sets SO_LINGER. With a non-zero duration, closing the socket blocks the
+    /// calling thread until the association has shut down or the time has passed,
+    /// also in `Drop`. Rounds up to whole seconds. `Some(Duration::ZERO)` is the
+    /// same as [`SctpSocket::set_abort_on_close`].
+    pub fn set_linger(&self, linger: Option<std::time::Duration>) -> Result<()> {
+        self.setsockopt(libc::SOL_SOCKET, libc::SO_LINGER, linger_value(linger))
+    }
+    /// With `true`, closing the socket sends ABORT right away instead of a graceful
+    /// SHUTDOWN, and data that wasn't sent yet is discarded. It doesn't block.
+    pub fn set_abort_on_close(&self, enable: bool) -> Result<()> {
+        self.set_linger(enable.then_some(std::time::Duration::ZERO))
     }
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
         let flag = match how {
@@ -928,6 +1380,13 @@ impl AsRawFd for SctpSocket {
     }
 }
 
+impl AsFd for SctpSocket {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // Safety: self owns the fd and closes it only in Drop
+        unsafe { BorrowedFd::borrow_raw(self.fd) }
+    }
+}
+
 /*
 fn write_fd(fd: RawFd, buf: &[u8]) -> Result<usize> {
     let rv = unsafe {
@@ -981,6 +1440,143 @@ mod tests {
     fn prim_matches_kernel_layout() {
         // the kernel rejects SCTP_PRIMARY_ADDR unless optlen == sizeof(struct sctp_prim)
         assert_eq!(std::mem::size_of::<Prim>(), 132);
+    }
+
+    #[test]
+    fn option_structs_match_kernel_layout() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<RawPaddrInfo>(), 152);
+        assert_eq!(size_of::<RawStatus>(), 176);
+        assert_eq!(offset_of!(RawStatus, sstat_primary), 24);
+        assert_eq!(size_of::<RawAssocParams>(), 20);
+        // the kernel rejects other sizes for SCTP_PEER_ADDR_PARAMS
+        assert_eq!(size_of::<RawPaddrParams>(), 156);
+        assert_eq!(offset_of!(PaddrParamsFields, spp_hbinterval), 132);
+        assert_eq!(offset_of!(PaddrParamsFields, spp_pathmaxrxt), 136);
+        assert_eq!(offset_of!(PaddrParamsFields, spp_pathmtu), 138);
+        assert_eq!(offset_of!(PaddrParamsFields, spp_flags), 146);
+        assert_eq!(offset_of!(PaddrParamsFields, spp_dscp), 154);
+    }
+
+    fn addr_bytes(addr: &str) -> Vec<u8> {
+        let addr: std::net::SocketAddr = addr.parse().unwrap();
+        let osa: OsSocketAddr = addr.into();
+        osa.as_ref().to_vec()
+    }
+
+    #[test]
+    fn parse_addr_list_entries() {
+        let (v4, v6) = ("10.0.1.2:3868", "[2001:db8::1]:3868");
+        // offset 1 makes every entry misaligned
+        let mut buf = vec![0u8];
+        buf.extend(addr_bytes(v4));
+        buf.extend(addr_bytes(v6));
+        buf.extend(addr_bytes(v4));
+        let expected: Vec<std::net::SocketAddr> =
+            [v4, v6, v4].iter().map(|a| a.parse().unwrap()).collect();
+        assert_eq!(parse_addr_list(&buf[1..], 3).unwrap(), expected);
+        // what follows the counted entries is ignored
+        assert_eq!(parse_addr_list(&buf[1..], 1).unwrap(), expected[..1]);
+        assert!(parse_addr_list(&[], 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_addr_list_invalid() {
+        let bytes = addr_bytes("10.0.1.2:3868");
+        for len in [0, 1, 2, bytes.len() - 1] {
+            let err = parse_addr_list(&bytes[..len], 1).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "len {len}");
+        }
+        // more entries announced than present
+        assert!(parse_addr_list(&bytes, 2).is_err());
+        let mut unknown = bytes.clone();
+        unknown[..2].copy_from_slice(&(libc::AF_UNIX as u16).to_ne_bytes());
+        assert!(parse_addr_list(&unknown, 1).is_err());
+    }
+
+    #[test]
+    fn option_states_convert() {
+        for (raw, state) in [
+            (0, AssocStatusState::Empty),
+            (1, AssocStatusState::Closed),
+            (2, AssocStatusState::CookieWait),
+            (3, AssocStatusState::CookieEchoed),
+            (4, AssocStatusState::Established),
+            (5, AssocStatusState::ShutdownPending),
+            (6, AssocStatusState::ShutdownSent),
+            (7, AssocStatusState::ShutdownReceived),
+            (8, AssocStatusState::ShutdownAckSent),
+            (99, AssocStatusState::Other(99)),
+        ] {
+            assert_eq!(AssocStatusState::from_raw(raw), state);
+        }
+        for (raw, state) in [
+            (0, PathState::Inactive),
+            (1, PathState::PotentiallyFailed),
+            (2, PathState::Active),
+            (3, PathState::Unconfirmed),
+            (0xffff, PathState::Other(0xffff)),
+        ] {
+            assert_eq!(PathState::from_raw(raw), state);
+        }
+    }
+
+    #[test]
+    fn path_params_flags() {
+        let raw_for = |heartbeat| {
+            let params = PathParams {
+                heartbeat,
+                max_retrans: None,
+            };
+            let raw = path_params_raw(None, params).unwrap().0;
+            (raw.spp_flags, raw.spp_hbinterval)
+        };
+        assert_eq!(raw_for(None), (0, 0));
+        assert_eq!(raw_for(Some(Heartbeat::Disabled)), (SPP_HB_DISABLE, 0));
+        assert_eq!(raw_for(Some(Heartbeat::Enabled)), (SPP_HB_ENABLE, 0));
+        assert_eq!(raw_for(Some(Heartbeat::Interval(50))), (SPP_HB_ENABLE, 50));
+        assert_eq!(
+            raw_for(Some(Heartbeat::Interval(0))),
+            (SPP_HB_ENABLE | SPP_HB_TIME_IS_ZERO, 0)
+        );
+    }
+
+    #[test]
+    fn zero_values_rejected() {
+        let zero_path = PathParams {
+            max_retrans: Some(0),
+            ..Default::default()
+        };
+        let err = path_params_raw(None, zero_path).err().unwrap();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        for params in [
+            AssocParams {
+                max_retrans: Some(0),
+                ..Default::default()
+            },
+            AssocParams {
+                cookie_life_ms: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let err = assoc_params_raw(params).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn linger_rounds_up() {
+        use std::time::Duration;
+        let value = |d| {
+            let l = linger_value(d);
+            (l.l_onoff, l.l_linger)
+        };
+        assert_eq!(value(None), (0, 0));
+        assert_eq!(value(Some(Duration::ZERO)), (1, 0));
+        // must not become 0, which would abort
+        assert_eq!(value(Some(Duration::from_millis(1))), (1, 1));
+        assert_eq!(value(Some(Duration::from_secs(2))), (1, 2));
+        assert_eq!(value(Some(Duration::MAX)), (1, libc::c_int::MAX));
     }
 
     // An SCTP_PEER_ADDR_CHANGE notification as the kernel delivers it.

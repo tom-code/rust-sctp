@@ -6,11 +6,24 @@ use std::{
 };
 
 use crate::*;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use tokio::io::{unix::AsyncFd, AsyncRead, AsyncWrite, Interest, ReadBuf};
 
 #[derive(Debug)]
 pub struct SctpSocketTokio {
     pub(crate) afd: AsyncFd<SctpSocket>,
+}
+
+impl AsRawFd for SctpSocketTokio {
+    fn as_raw_fd(&self) -> RawFd {
+        self.afd.get_ref().as_raw_fd()
+    }
+}
+
+impl AsFd for SctpSocketTokio {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.afd.get_ref().as_fd()
+    }
 }
 
 impl AsyncRead for SctpSocketTokio {
@@ -280,6 +293,50 @@ impl SctpSocketTokio {
     }
     pub fn set_rcvbuf(&self, size: i32) -> Result<()> {
         self.afd.get_ref().set_rcvbuf(size)
+    }
+    pub fn set_sndbuf(&self, size: i32) -> Result<()> {
+        self.afd.get_ref().set_sndbuf(size)
+    }
+    /// See [`SctpSocket::peer_addrs`].
+    pub fn peer_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        self.afd.get_ref().peer_addrs()
+    }
+    /// See [`SctpSocket::local_addrs`].
+    pub fn local_addrs(&self) -> Result<Vec<std::net::SocketAddr>> {
+        self.afd.get_ref().local_addrs()
+    }
+    /// See [`SctpSocket::status`].
+    pub fn status(&self) -> Result<AssocStatus> {
+        self.afd.get_ref().status()
+    }
+    /// See [`SctpSocket::set_path_params`].
+    pub fn set_path_params(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+        params: PathParams,
+    ) -> Result<()> {
+        self.afd.get_ref().set_path_params(addr, params)
+    }
+    /// See [`SctpSocket::path_params`].
+    pub fn path_params(&self, addr: Option<std::net::SocketAddr>) -> Result<PathConfig> {
+        self.afd.get_ref().path_params(addr)
+    }
+    /// See [`SctpSocket::set_assoc_params`].
+    pub fn set_assoc_params(&self, params: AssocParams) -> Result<()> {
+        self.afd.get_ref().set_assoc_params(params)
+    }
+    /// See [`SctpSocket::assoc_params`].
+    pub fn assoc_params(&self) -> Result<AssocConfig> {
+        self.afd.get_ref().assoc_params()
+    }
+    /// See [`SctpSocket::set_reuse_addr`].
+    pub fn set_reuse_addr(&self, enable: bool) -> Result<()> {
+        self.afd.get_ref().set_reuse_addr(enable)
+    }
+    /// See [`SctpSocket::set_abort_on_close`]. There is no timed linger on this
+    /// type: it would block the executor thread when the socket is dropped.
+    pub fn set_abort_on_close(&self, enable: bool) -> Result<()> {
+        self.afd.get_ref().set_abort_on_close(enable)
     }
     pub fn getsocketname(&self) -> Result<std::net::SocketAddr> {
         self.afd.get_ref().getsocketname()
